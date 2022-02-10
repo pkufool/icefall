@@ -18,17 +18,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class Decoder(nn.Module):
     """This class modifies the stateless decoder from the following paper:
-
         RNN-transducer with stateless prediction network
         https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=9054419
-
     It removes the recurrent connection from the decoder, i.e., the prediction
     network. Different from the above paper, it adds an extra Conv1d
     right after the embedding layer.
-
     TODO: Implement https://arxiv.org/pdf/2109.07513.pdf
     """
 
@@ -38,6 +34,7 @@ class Decoder(nn.Module):
         embedding_dim: int,
         blank_id: int,
         context_size: int,
+        use_right_context: bool = False,
     ):
         """
         Args:
@@ -50,6 +47,9 @@ class Decoder(nn.Module):
           context_size:
             Number of previous words to use to predict the next word.
             1 means bigram; 2 means trigram. n means (n+1)-gram.
+          use_right_context:
+            True to use right context, which is usefull to implement a
+            backward decoder, only used for training.
         """
         super().__init__()
         self.embedding = nn.Embedding(
@@ -61,6 +61,7 @@ class Decoder(nn.Module):
 
         assert context_size >= 1, context_size
         self.context_size = context_size
+        self.use_right_context = use_right_context
         if context_size > 1:
             self.conv = nn.Conv1d(
                 in_channels=embedding_dim,
@@ -87,13 +88,32 @@ class Decoder(nn.Module):
         if self.context_size > 1:
             embedding_out = embedding_out.permute(0, 2, 1)
             if need_pad is True:
-                embedding_out = F.pad(
-                    embedding_out, pad=(self.context_size - 1, 0)
-                )
+                # Regarding the left or right context we are using,
+                # if we feed sequence [sos, a, b, c, d] to this decoder, and
+                # want to predict the sequence [a, b, c, d]. After padding to
+                # the left with context_size==2, the fed in sequence changes to
+                # [pad, sos, a, b, c, d], and we use `pad,sos` to predict `a`,
+                # `sos,a` to predict `b` ..., that is left context.
+                # if we feed sequence [b, c, d, blk, blk] to this decoder,
+                # and want to predict the sequence [a, b, c, d]. After padding
+                # to the right with context_size==2, the fed in sequence changes
+                # to [b, c, d, blk, blk, pad], and we use `b, c` to predict `a`
+                # `c,d` to predict `b` ..., that is right context.
+                # This is tricky and not so straightforward, will find better
+                # implementation later.
+                if self.use_right_context:
+                    embedding_out = F.pad(
+                        embedding_out, pad=(0, self.context_size - 1)
+                    )
+                else:
+                    embedding_out = F.pad(
+                        embedding_out, pad=(self.context_size - 1, 0)
+                    )
             else:
                 # During inference time, there is no need to do extra padding
                 # as we only need one output
                 assert embedding_out.size(-1) == self.context_size
+                assert self.use_right_context is False
             embedding_out = self.conv(embedding_out)
             embedding_out = embedding_out.permute(0, 2, 1)
         embedding_out = self.output_linear(F.relu(embedding_out))

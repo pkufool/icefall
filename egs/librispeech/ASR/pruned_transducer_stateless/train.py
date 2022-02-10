@@ -261,12 +261,13 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
     return encoder
 
 
-def get_decoder_model(params: AttributeDict) -> nn.Module:
+def get_decoder_model(params: AttributeDict, use_right_context: bool = False) -> nn.Module:
     decoder = Decoder(
         vocab_size=params.vocab_size,
         embedding_dim=params.embedding_dim,
         blank_id=params.blank_id,
         context_size=params.context_size,
+        use_right_context=use_right_context,
     )
     return decoder
 
@@ -283,12 +284,16 @@ def get_joiner_model(params: AttributeDict) -> nn.Module:
 def get_transducer_model(params: AttributeDict) -> nn.Module:
     encoder = get_encoder_model(params)
     decoder = get_decoder_model(params)
+    backward_decoder = get_decoder_model(params, use_right_context=True)
     joiner = get_joiner_model(params)
+    backward_joiner = get_joiner_model(params)
 
     model = Transducer(
         encoder=encoder,
         decoder=decoder,
+        backward_decoder=backward_decoder,
         joiner=joiner,
+        backward_joiner=backward_joiner,
         prune_range=params.prune_range,
         lm_scale=params.lm_scale,
         am_scale=params.am_scale,
@@ -420,8 +425,8 @@ def compute_loss(
     y = k2.RaggedTensor(y).to(device)
 
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss = model(x=feature, x_lens=feature_lens, y=y)
-        loss = simple_loss + pruned_loss
+        simple_loss, pruned_loss, backward_pruned_loss = model(x=feature, x_lens=feature_lens, y=y)
+        loss = 0.5 * simple_loss + pruned_loss + 0.5 * backward_pruned_loss
 
     assert loss.requires_grad == is_training
 
@@ -432,6 +437,7 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    info["backward_pruned_loss"] = backward_pruned_loss.detach().cpu().item()
 
     return loss, info
 
