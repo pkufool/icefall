@@ -197,10 +197,6 @@ class Conformer(Transformer):
                 # store the result  of chunk_by_chunk decoding
                 encoder_output = []
 
-                # caches
-                pos_emb_positive = []
-                pos_emb_negative = []
-                pos_emb_central = None
                 encoder_cache = [None for i in range(len(self.encoder.layers))]
                 conv_cache = [None for i in range(len(self.encoder.layers))]
 
@@ -217,39 +213,6 @@ class Conformer(Transformer):
                         cur_feature, offset)
                     cur_embed = cur_embed.permute(1, 0,
                                                   2)  # (B, T, F) -> (T, B, F)
-
-                    cur_T = cur_feature.size(1)
-                    if cur == 0:
-                        real_chunk_size = min(cur_T, chunk_size)
-                        assert (
-                            cur_pos_emb.size(1) == 2 * real_chunk_size - 1
-                        ), f"{cur_pos_emb.size(1)} == 2 * {real_chunk_size} - 1"
-
-                        # Extract the central pos embedding during first chunk
-                        pos_emb_central = cur_pos_emb[0,
-                                                      (real_chunk_size -
-                                                       1), :].view(1, 1, -1)
-                        cur_T -= 1
-
-                    # first chunk with chunk_size > 1
-                    # or not first chunk
-                    if (cur_T > 1 and cur == 0) or cur != 0:
-                        pos_emb_positive.append(cur_pos_emb[0, :cur_T].flip(0))
-                        pos_emb_negative.append(cur_pos_emb[0, -cur_T:])
-
-                        assert pos_emb_positive[-1].size(0) == cur_T
-
-                        pos_emb_pos = torch.cat(pos_emb_positive,
-                                                dim=0).unsqueeze(0)
-                        pos_emb_neg = torch.cat(pos_emb_negative,
-                                                dim=0).unsqueeze(0)
-                        cur_pos_emb = torch.cat(
-                            [
-                                pos_emb_pos.flip(1), pos_emb_central,
-                                pos_emb_neg
-                            ],
-                            dim=1,
-                        )
 
                     x = self.encoder.chunk_forward(
                         cur_embed,
@@ -716,8 +679,6 @@ class RelPositionalEncoding(torch.nn.Module):
                           1:self.pe.size(1) // 2  # noqa E203
                           + x_size_1, ]
         x_T = x.size(1)
-        if offset > 0:
-            pos_emb = torch.cat([pos_emb[:, :x_T], pos_emb[:, -x_T:]], dim=1)
 
         return self.dropout(x), self.dropout(pos_emb)
 
