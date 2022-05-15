@@ -18,13 +18,77 @@
 import logging
 import math
 import warnings
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor, nn
 from transformer import Transformer
 
 from icefall.utils import make_pad_mask, subsequent_chunk_mask
+
+
+class DecodeStates(object):
+    def __init__(self,
+                 layers: int,
+                 left_context: int,
+                 dim: int,
+                 init: bool = True,
+                 dtype: torch.dtype = torch.float32,
+                 device: torch.device = torch.device('cpu')):
+        self.layers = layers
+        self.left_context = left_context
+        self.dim = dim
+        self.dtype = dtype
+        self.device = device
+        if init:
+            # shape (layer, T, dim)
+            self.attn_cache = torch.zeros((layers, left_context, dim),
+                                          dtype=dtype,
+                                          device=device)
+            self.conv_cache = torch.zeros((layers, left_context, dim),
+                                          dtype=dtype,
+                                          device=device)
+            self.offset = torch.tensor([0], dtype=dtype, device=device)
+
+    @staticmethod
+    def stack(states: List['DecodeStates']) -> 'DecodeStates':
+        assert len(states) >= 1
+        obj = DecodeStates(layers=states[0].layers,
+                           left_context=states[0].left_context,
+                           dim=states[0].dim,
+                           init=False,
+                           dtype=states[0].dtype,
+                           device=states[0].device)
+        attn_cache = []
+        conv_cache = []
+        offset = []
+        for i in range(len(states)):
+            attn_cache.append(states[i].attn_cache)
+            conv_cache.append(states[i].conv_cache)
+            offset.append(states[i].offset)
+        obj.attn_cache = torch.stack(attn_cache, dim=2)
+        obj.conv_cache = torch.stack(conv_cache, dim=2)
+        obj.offset = torch.stack(offset, dim=0)
+        return obj
+
+    @staticmethod
+    def unstack(states: 'DecodeStates') -> List['DecodeStates']:
+        results = []
+        attn_cache = torch.unbind(states.attn_cache, dim=2)
+        conv_cache = torch.unbind(states.conv_cache, dim=2)
+        offset = torch.unbind(states.offset, dim=0)
+        for i in range(states.attn_cache.size(2)):
+            obj = DecodeStates(layers=states.layers,
+                               left_context=states.left_context,
+                               dim=states.dim,
+                               init=False,
+                               dtype=states.dtype,
+                               device=states.device)
+            obj.attn_cache = attn_cache[i]
+            obj.conv_cache = conv_cache[i]
+            obj.offset = offset[i]
+            results.append(obj)
+        return results
 
 
 class Conformer(Transformer):
@@ -224,6 +288,12 @@ class Conformer(Transformer):
                         conv_cache=conv_cache,
                         offset=offset,
                     )  # (T, B, F)
+                    for i in range(len(encoder_cache)):
+                        logging.info(
+                            f"layer {i} shape : {encoder_cache[i].shape}")
+                        logging.info(
+                            f"layer {i} shape : {conv_cache[i].shape}")
+
                     encoder_output.append(x)
                     offset += cur_embed.size(0)
 
@@ -259,6 +329,43 @@ class Conformer(Transformer):
         logits = logits.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
 
         return logits, lengths
+
+    def streaming_forward2(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        decode_states: DecodeStates,
+        left_context: int = 32,
+    ) -> Tuple[torch.Tensor, torch.Tensor, DecodeStates]:
+        # x: [N, T, C]
+
+        # Caution: We assume the subsampling factor is 4!
+        lengths = ((x_lens - 1) // 2 - 1) // 2
+        src_key_padding_mask = make_pad_mask(lengths + left_context)
+
+        embed = self.encoder_embed(x)
+        embed, pos_enc = self.encoder_pos(embed, decode_states.offset,
+                                          decode_states.left_context)
+        embed = embed.permute(1, 0, 2)  # (B, T, F) -> (T, B, F)
+
+        x = self.encoder.chunk_forward(
+            embed,
+            pos_enc,
+            src_key_padding_mask=src_key_padding_mask,
+            encoder_cache=decode_states.attn_cache,
+            conv_cache=decode_states.conv_cache,
+            offset=decode_states.left_context,
+        )  # (T, B, F)
+
+        decode_states.offset += embed.size(0)
+
+        if self.normalize_before:
+            x = self.after_norm(x)
+
+        logits = self.encoder_output_layer(x)
+        logits = logits.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
+
+        return logits, lengths, decode_states
 
 
 class ConformerEncoderLayer(nn.Module):
@@ -585,12 +692,12 @@ class ConformerEncoder(nn.TransformerEncoder):
                 pos_emb,
                 src_mask=mask,
                 src_key_padding_mask=src_key_padding_mask,
-                encoder_cache=encoder_cache[layer_index],
-                conv_cache=conv_cache[layer_index],
+                encoder_cache=encoder_cache[layer_index, ...],
+                conv_cache=conv_cache[layer_index, ...],
                 offset=offset,
             )
-            encoder_cache[layer_index] = e_cache
-            conv_cache[layer_index] = c_cache
+            encoder_cache[layer_index, ...] = e_cache[-64:, :, :]
+            conv_cache[layer_index, ...] = c_cache[-64:, :, :]
 
         if self.norm is not None:
             output = self.norm(output)
@@ -620,11 +727,11 @@ class RelPositionalEncoding(torch.nn.Module):
         self.xscale = math.sqrt(self.d_model)
         self.dropout = torch.nn.Dropout(p=dropout_rate)
         self.pe = None
-        self.extend_pe(torch.tensor(0.0).expand(1, max_len))
+        self.extend_pe(torch.tensor(0.0).expand(1, max_len), max_len)
 
     def extend_pe(self, x: Tensor, offset: int = 0) -> None:
         """Reset the positional encodings."""
-        x_size_1 = offset + x.size(1)
+        x_size_1 = offset
         if self.pe is not None:
             # self.pe contains both positive and negative parts
             # the length of self.pe is 2 * input_len - 1
@@ -658,7 +765,8 @@ class RelPositionalEncoding(torch.nn.Module):
 
     def forward(self,
                 x: torch.Tensor,
-                offset: int = 0) -> Tuple[Tensor, Tensor]:
+                offset: Optional[torch.Tensor] = None,
+                left_context: int = 0) -> Tuple[Tensor, Tensor]:
         """Add positional encoding.
 
         Args:
@@ -671,16 +779,48 @@ class RelPositionalEncoding(torch.nn.Module):
             torch.Tensor: Encoded tensor (batch, 2*time-1, `*`).
 
         """
-        self.extend_pe(x, offset)
-        x = x * self.xscale
-        x_size_1 = offset + x.size(1)
-        pos_emb = self.pe[:,
-                          self.pe.size(1) // 2 - x_size_1 +
-                          1:self.pe.size(1) // 2  # noqa E203
-                          + x_size_1, ]
-        x_T = x.size(1)
+        if offset is None:
+            assert left_context == 0
+            max_len = x.size(1)
+        else:
+            assert left_context >= 0
+            assert offset.shape == (
+                x.size(0), 1
+            ), f"offset shape : {offset.shape}, expected : {(x.size(0), 1)}"
+            max_len = torch.max(offset).to(
+                torch.int32).item() + x.size(1) + left_context
 
-        return self.dropout(x), self.dropout(pos_emb)
+        self.extend_pe(x, max_len)
+        x = x * self.xscale
+
+        # pos_enc shape : (2 * l - 1, dim)
+        l = left_context + x.size(1)
+        offset = offset + x.size(1)
+
+        central_index = torch.tensor(self.pe.size(1) // 2,
+                                     dtype=offset.dtype,
+                                     device=offset.device).expand(
+                                         offset.size(0), 1)
+        neg_index = offset.expand((offset.size(0), l - 1))
+        neg_index = central_index - neg_index
+        neg_index = neg_index + torch.arange(
+            l - 1, dtype=offset.dtype, device=offset.device)
+
+        pos_index = offset.expand((offset.size(0), l - 1))
+        pos_index = central_index + pos_index
+        pos_index = pos_index - torch.arange(
+            l - 2, -1, -1, dtype=offset.dtype, device=offset.device)
+        index = torch.cat([neg_index, central_index, pos_index],
+                          dim=1).to(torch.int64)
+
+        pos_enc = torch.gather(input=self.pe.expand(
+            (offset.size(0), self.pe.size(1), self.pe.size(2))),
+                               dim=1,
+                               index=index.unsqueeze(2).expand(
+                                   (index.size(0), index.size(1),
+                                    self.pe.size(2))))
+
+        return self.dropout(x), self.dropout(pos_enc)
 
 
 class RelPositionMultiheadAttention(nn.Module):
