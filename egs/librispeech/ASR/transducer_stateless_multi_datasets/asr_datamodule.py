@@ -1,5 +1,6 @@
 # Copyright      2021  Piotr Żelasko
-#                2022  Xiaomi Corp.        (authors: Fangjun Kuang)
+#                2022  Xiaomi Corp.        (authors: Fangjun Kuang
+# 						     Mingshuang Luo)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -16,10 +17,12 @@
 # limitations under the License.
 
 import argparse
+import inspect
 import logging
 from pathlib import Path
 from typing import Optional
 
+import torch
 from lhotse import CutSet, Fbank, FbankConfig
 from lhotse.dataset import (
     BucketingSampler,
@@ -32,9 +35,18 @@ from lhotse.dataset.input_strategies import (
     OnTheFlyFeatures,
     PrecomputedFeatures,
 )
+from lhotse.utils import fix_random_seed
 from torch.utils.data import DataLoader
 
 from icefall.utils import str2bool
+
+
+class _SeedWorkers:
+    def __init__(self, seed: int):
+        self.seed = seed
+
+    def __call__(self, worker_id: int):
+        fix_random_seed(self.seed + worker_id)
 
 
 class AsrDataModule:
@@ -180,10 +192,20 @@ class AsrDataModule:
             logging.info(
                 f"Time warp factor: {self.args.spec_aug_time_warp_factor}"
             )
+            # Set the value of num_frame_masks according to Lhotse's version.
+            # In different Lhotse's versions, the default of num_frame_masks is
+            # different.
+            num_frame_masks = 10
+            num_frame_masks_parameter = inspect.signature(
+                SpecAugment.__init__
+            ).parameters["num_frame_masks"]
+            if num_frame_masks_parameter.default == 1:
+                num_frame_masks = 2
+            logging.info(f"Num frame mask: {num_frame_masks}")
             input_transforms.append(
                 SpecAugment(
                     time_warp_factor=self.args.spec_aug_time_warp_factor,
-                    num_frame_masks=2,
+                    num_frame_masks=num_frame_masks,
                     features_mask_size=27,
                     num_feature_masks=2,
                     frames_mask_size=100,
@@ -241,12 +263,19 @@ class AsrDataModule:
             )
 
         logging.info("About to create train dataloader")
+
+        # 'seed' is derived from the current random state, which will have
+        # previously been set in the main process.
+        seed = torch.randint(0, 100000, ()).item()
+        worker_init_fn = _SeedWorkers(seed)
+
         train_dl = DataLoader(
             train,
             sampler=train_sampler,
             batch_size=None,
             num_workers=self.args.num_workers,
             persistent_workers=False,
+            worker_init_fn=worker_init_fn,
         )
         return train_dl
 

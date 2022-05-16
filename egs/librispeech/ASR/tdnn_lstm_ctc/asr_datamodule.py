@@ -1,4 +1,5 @@
 # Copyright      2021  Piotr Żelasko
+# Copyright      2022  Xiaomi Corporation     (Author: Mingshuang Luo)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -16,10 +17,13 @@
 
 
 import argparse
+import inspect
 import logging
 from functools import lru_cache
 from pathlib import Path
+from typing import Any, Dict, Optional
 
+import torch
 from lhotse import CutSet, Fbank, FbankConfig, load_manifest
 from lhotse.dataset import (
     BucketingSampler,
@@ -31,9 +35,18 @@ from lhotse.dataset import (
     SpecAugment,
 )
 from lhotse.dataset.input_strategies import OnTheFlyFeatures
+from lhotse.utils import fix_random_seed
 from torch.utils.data import DataLoader
 
 from icefall.utils import str2bool
+
+
+class _SeedWorkers:
+    def __init__(self, seed: int):
+        self.seed = seed
+
+    def __call__(self, worker_id: int):
+        fix_random_seed(self.seed + worker_id)
 
 
 class LibriSpeechAsrDataModule:
@@ -179,15 +192,25 @@ class LibriSpeechAsrDataModule:
             "with training dataset. ",
         )
 
-    def train_dataloaders(self, cuts_train: CutSet) -> DataLoader:
-        logging.info("About to get Musan cuts")
-        cuts_musan = load_manifest(
-            self.args.manifest_dir / "cuts_musan.json.gz"
-        )
-
+    def train_dataloaders(
+        self,
+        cuts_train: CutSet,
+        sampler_state_dict: Optional[Dict[str, Any]] = None,
+    ) -> DataLoader:
+        """
+        Args:
+          cuts_train:
+            CutSet for training.
+          sampler_state_dict:
+            The state dict for the training sampler.
+        """
         transforms = []
         if self.args.enable_musan:
             logging.info("Enable MUSAN")
+            logging.info("About to get Musan cuts")
+            cuts_musan = load_manifest(
+                self.args.manifest_dir / "cuts_musan.json.gz"
+            )
             transforms.append(
                 CutMix(
                     cuts=cuts_musan, prob=0.5, snr=(10, 20), preserve_id=True
@@ -216,10 +239,20 @@ class LibriSpeechAsrDataModule:
             logging.info(
                 f"Time warp factor: {self.args.spec_aug_time_warp_factor}"
             )
+            # Set the value of num_frame_masks according to Lhotse's version.
+            # In different Lhotse's versions, the default of num_frame_masks is
+            # different.
+            num_frame_masks = 10
+            num_frame_masks_parameter = inspect.signature(
+                SpecAugment.__init__
+            ).parameters["num_frame_masks"]
+            if num_frame_masks_parameter.default == 1:
+                num_frame_masks = 2
+            logging.info(f"Num frame mask: {num_frame_masks}")
             input_transforms.append(
                 SpecAugment(
                     time_warp_factor=self.args.spec_aug_time_warp_factor,
-                    num_frame_masks=2,
+                    num_frame_masks=num_frame_masks,
                     features_mask_size=27,
                     num_feature_masks=2,
                     frames_mask_size=100,
@@ -274,12 +307,22 @@ class LibriSpeechAsrDataModule:
             )
         logging.info("About to create train dataloader")
 
+        if sampler_state_dict is not None:
+            logging.info("Loading sampler state dict")
+            train_sampler.load_state_dict(sampler_state_dict)
+
+        # 'seed' is derived from the current random state, which will have
+        # previously been set in the main process.
+        seed = torch.randint(0, 100000, ()).item()
+        worker_init_fn = _SeedWorkers(seed)
+
         train_dl = DataLoader(
             train,
             sampler=train_sampler,
             batch_size=None,
             num_workers=self.args.num_workers,
             persistent_workers=False,
+            worker_init_fn=worker_init_fn,
         )
 
         return train_dl

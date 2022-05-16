@@ -19,7 +19,7 @@
 """
 Usage:
 
-# greedy search
+(1) greedy search
 ./transducer_stateless_modified/pretrained.py \
   --checkpoint /path/to/pretrained.pt \
   --lang-dir /path/to/lang_char \
@@ -27,7 +27,7 @@ Usage:
   /path/to/foo.wav \
   /path/to/bar.wav
 
-# beam search
+(2) beam search
 ./transducer_stateless_modified/pretrained.py \
   --checkpoint /path/to/pretrained.pt \
   --lang-dir /path/to/lang_char \
@@ -36,7 +36,7 @@ Usage:
   /path/to/foo.wav \
   /path/to/bar.wav
 
-# modified beam search
+(3) modified beam search
 ./transducer_stateless_modified/pretrained.py \
   --checkpoint /path/to/pretrained.pt \
   --lang-dir /path/to/lang_char \
@@ -45,6 +45,14 @@ Usage:
   /path/to/foo.wav \
   /path/to/bar.wav
 
+(4) fast beam search
+./transducer_stateless_modified/pretrained.py \
+  --checkpoint /path/to/pretrained.pt \
+  --lang-dir /path/to/lang_char \
+  --method fast_beam_search \
+  --beam-size 4 \
+  /path/to/foo.wav \
+  /path/to/bar.wav
 """
 
 import argparse
@@ -53,20 +61,21 @@ import math
 from pathlib import Path
 from typing import List
 
+import k2
 import kaldifeat
 import torch
-import torch.nn as nn
 import torchaudio
-from beam_search import beam_search, greedy_search, modified_beam_search
-from conformer import Conformer
-from decoder import Decoder
-from joiner import Joiner
-from model import Transducer
+from beam_search import (
+    beam_search,
+    fast_beam_search_one_best,
+    greedy_search,
+    greedy_search_batch,
+    modified_beam_search,
+)
 from torch.nn.utils.rnn import pad_sequence
+from train import get_params, get_transducer_model
 
-from icefall.env import get_env_info
 from icefall.lexicon import Lexicon
-from icefall.utils import AttributeDict
 
 
 def get_parser():
@@ -98,6 +107,7 @@ def get_parser():
           - greedy_search
           - beam_search
           - modified_beam_search
+          - fast_beam_search
         """,
     )
 
@@ -112,10 +122,43 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--sample-rate",
+        type=int,
+        default=16000,
+        help="The sample rate of the input sound file",
+    )
+
+    parser.add_argument(
         "--beam-size",
         type=int,
         default=4,
-        help="Used only when --method is beam_search and modified_beam_search",
+        help="""An integer indicating how many candidates we will keep for each
+        frame. Used only when --method is beam_search or
+        modified_beam_search.""",
+    )
+
+    parser.add_argument(
+        "--beam",
+        type=float,
+        default=4,
+        help="""A floating point value to calculate the cutoff score during beam
+        search (i.e., `cutoff = max-score - beam`), which is the same as the
+        `beam` in Kaldi.
+        Used only when --method is fast_beam_search""",
+    )
+
+    parser.add_argument(
+        "--max-contexts",
+        type=int,
+        default=4,
+        help="""Used only when --method is fast_beam_search""",
+    )
+
+    parser.add_argument(
+        "--max-states",
+        type=int,
+        default=8,
+        help="""Used only when --method is fast_beam_search""",
     )
 
     parser.add_argument(
@@ -128,77 +171,12 @@ def get_parser():
     parser.add_argument(
         "--max-sym-per-frame",
         type=int,
-        default=3,
+        default=1,
         help="Maximum number of symbols per frame. "
         "Use only when --method is greedy_search",
     )
-    return parser
 
     return parser
-
-
-def get_params() -> AttributeDict:
-    params = AttributeDict(
-        {
-            # parameters for conformer
-            "feature_dim": 80,
-            "encoder_out_dim": 512,
-            "subsampling_factor": 4,
-            "attention_dim": 512,
-            "nhead": 8,
-            "dim_feedforward": 2048,
-            "num_encoder_layers": 12,
-            "vgg_frontend": False,
-            "env_info": get_env_info(),
-            "sample_rate": 16000,
-        }
-    )
-    return params
-
-
-def get_encoder_model(params: AttributeDict) -> nn.Module:
-    encoder = Conformer(
-        num_features=params.feature_dim,
-        output_dim=params.encoder_out_dim,
-        subsampling_factor=params.subsampling_factor,
-        d_model=params.attention_dim,
-        nhead=params.nhead,
-        dim_feedforward=params.dim_feedforward,
-        num_encoder_layers=params.num_encoder_layers,
-        vgg_frontend=params.vgg_frontend,
-    )
-    return encoder
-
-
-def get_decoder_model(params: AttributeDict) -> nn.Module:
-    decoder = Decoder(
-        vocab_size=params.vocab_size,
-        embedding_dim=params.encoder_out_dim,
-        blank_id=params.blank_id,
-        context_size=params.context_size,
-    )
-    return decoder
-
-
-def get_joiner_model(params: AttributeDict) -> nn.Module:
-    joiner = Joiner(
-        input_dim=params.encoder_out_dim,
-        output_dim=params.vocab_size,
-    )
-    return joiner
-
-
-def get_transducer_model(params: AttributeDict) -> nn.Module:
-    encoder = get_encoder_model(params)
-    decoder = get_decoder_model(params)
-    joiner = get_joiner_model(params)
-
-    model = Transducer(
-        encoder=encoder,
-        decoder=decoder,
-        joiner=joiner,
-    )
-    return model
 
 
 def read_sound_files(
@@ -225,6 +203,7 @@ def read_sound_files(
     return ans
 
 
+@torch.no_grad()
 def main():
     parser = get_parser()
     args = parser.parse_args()
@@ -279,13 +258,40 @@ def main():
         features, batch_first=True, padding_value=math.log(1e-10)
     )
 
-    hyps = []
-    with torch.no_grad():
-        encoder_out, encoder_out_lens = model.encoder(
-            x=features, x_lens=feature_lens
-        )
+    encoder_out, encoder_out_lens = model.encoder(
+        x=features, x_lens=feature_lens
+    )
 
-        for i in range(encoder_out.size(0)):
+    num_waves = encoder_out.size(0)
+    hyp_list = []
+    logging.info(f"Using {params.method}")
+
+    if params.method == "fast_beam_search":
+        decoding_graph = k2.trivial_graph(params.vocab_size - 1, device=device)
+        hyp_list = fast_beam_search_one_best(
+            model=model,
+            decoding_graph=decoding_graph,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+            beam=params.beam,
+            max_contexts=params.max_contexts,
+            max_states=params.max_states,
+        )
+    elif params.method == "greedy_search" and params.max_sym_per_frame == 1:
+        hyp_list = greedy_search_batch(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+        )
+    elif params.method == "modified_beam_search":
+        hyp_list = modified_beam_search(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+            beam=params.beam_size,
+        )
+    else:
+        for i in range(num_waves):
             # fmt: off
             encoder_out_i = encoder_out[i:i+1, :encoder_out_lens[i]]
             # fmt: on
@@ -301,17 +307,15 @@ def main():
                     encoder_out=encoder_out_i,
                     beam=params.beam_size,
                 )
-            elif params.method == "modified_beam_search":
-                hyp = modified_beam_search(
-                    model=model,
-                    encoder_out=encoder_out_i,
-                    beam=params.beam_size,
-                )
             else:
                 raise ValueError(
                     f"Unsupported decoding method: {params.method}"
                 )
-            hyps.append([lexicon.token_table[i] for i in hyp])
+            hyp_list.append(hyp)
+
+    hyps = []
+    for hyp in hyp_list:
+        hyps.append([lexicon.token_table[i] for i in hyp])
 
     s = "\n"
     for filename, hyp in zip(params.sound_files, hyps):
