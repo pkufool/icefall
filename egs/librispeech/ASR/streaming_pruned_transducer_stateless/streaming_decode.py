@@ -51,7 +51,7 @@ import torch
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
 from beam_search import beam_search, greedy_search
-from conformer import Conformer
+from conformer import Conformer, DecodeStates
 from decoder import Decoder
 from joiner import Joiner
 from model import Transducer
@@ -279,13 +279,40 @@ def decode_one_batch(
 
     feature_lens = supervisions["num_frames"].to(device)
 
-    encoder_out, encoder_out_lens = model.encoder.streaming_forward(
-        x=feature,
-        x_lens=feature_lens,
-        chunk_size=params.right_chunk_size,
-        simulate_streaming=params.simulate_streaming,
-    )
+    chunk_size = 64
+    left_context = 64
 
+    states = [
+        DecodeStates(params.num_encoder_layers,
+                     left_context,
+                     params.attention_dim,
+                     device=device) for i in range(feature.size(0))
+    ]
+
+    encoder_out_list = []
+
+    states = DecodeStates.stack(states)
+
+    for i in range(0, feature.size(1), chunk_size):
+        if i + chunk_size + 3 > feature.size(1):
+            break
+        sub_feature = feature[:, i:i + chunk_size + 3, :]
+        sub_feature_lens = torch.tensor([chunk_size + 3] * feature.size(0)).to(
+            feature_lens.dtype).to(feature_lens.device)
+        encoder_out, encoder_out_lens, states = model.encoder.streaming_forward2(
+            x=sub_feature,
+            x_lens=sub_feature_lens,
+            decode_states=states,
+            left_context=left_context,
+        )
+
+        encoder_out_list.append(encoder_out)
+
+        # states = DecodeStates.unstack(states)
+        # states = DecodeStates.stack(states)
+
+    encoder_out = torch.cat(encoder_out_list, dim=1)
+    encoder_out_lens = feature_lens // 4
     logging.info(f"encoder_out shape : {encoder_out.shape}")
     logging.info(f"encoder_out_lens : {encoder_out_lens}")
 

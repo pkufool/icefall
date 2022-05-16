@@ -265,8 +265,12 @@ class Conformer(Transformer):
                 conv_cache = [None for i in range(len(self.encoder.layers))]
 
                 # start chunk_by_chunk decoding
-                offset = 0
                 feature = x
+                offset = torch.tensor([0] * feature.size(0),
+                                      device=feature.device,
+                                      dtype=torch.int64).reshape(
+                                          (feature.size(0), 1))
+                context = 0
                 num_frames = feature.size(1)
                 for cur in range(0, num_frames - embed_left_context + 1,
                                  stride):
@@ -274,28 +278,29 @@ class Conformer(Transformer):
                     cur_feature = feature[:, cur:end, :]
                     cur_feature = self.encoder_embed(cur_feature)
                     cur_embed, cur_pos_emb = self.encoder_pos(
-                        cur_feature, offset)
+                        cur_feature, offset, context)
                     cur_embed = cur_embed.permute(1, 0,
                                                   2)  # (B, T, F) -> (T, B, F)
 
                     x = self.encoder.chunk_forward(
                         cur_embed,
                         cur_pos_emb,
-                        src_key_padding_mask=src_key_padding_mask[:, :offset +
+                        src_key_padding_mask=src_key_padding_mask[:, :context +
                                                                   cur_embed.
                                                                   size(0)],
                         encoder_cache=encoder_cache,
                         conv_cache=conv_cache,
-                        offset=offset,
+                        offset=context,
                     )  # (T, B, F)
-                    for i in range(len(encoder_cache)):
-                        logging.info(
-                            f"layer {i} shape : {encoder_cache[i].shape}")
-                        logging.info(
-                            f"layer {i} shape : {conv_cache[i].shape}")
+                    # for i in range(len(encoder_cache)):
+                    # logging.info(
+                    # f"layer {i} shape : {encoder_cache[i].shape}")
+                    # logging.info(
+                    # f"layer {i} shape : {conv_cache[i].shape}")
 
                     encoder_output.append(x)
                     offset += cur_embed.size(0)
+                    context += cur_embed.size(0)
 
                 assert num_frames - end <= 3
                 if num_frames != end:
@@ -692,12 +697,14 @@ class ConformerEncoder(nn.TransformerEncoder):
                 pos_emb,
                 src_mask=mask,
                 src_key_padding_mask=src_key_padding_mask,
-                encoder_cache=encoder_cache[layer_index, ...],
-                conv_cache=conv_cache[layer_index, ...],
+                encoder_cache=encoder_cache[layer_index],
+                conv_cache=conv_cache[layer_index],
                 offset=offset,
             )
             encoder_cache[layer_index, ...] = e_cache[-64:, :, :]
             conv_cache[layer_index, ...] = c_cache[-64:, :, :]
+            # encoder_cache[layer_index] = e_cache
+            # conv_cache[layer_index] = c_cache
 
         if self.norm is not None:
             output = self.norm(output)
