@@ -201,6 +201,7 @@ def get_decoder_model(params: AttributeDict) -> nn.Module:
         vocab_size=params.vocab_size,
         embedding_dim=params.embedding_dim,
         blank_id=params.blank_id,
+        unk_id=params.unk_id,
         context_size=params.context_size,
     )
     return decoder
@@ -293,18 +294,29 @@ def decode_one_batch(
 
     states = DecodeStates.stack(states)
 
-    for i in range(0, feature.size(1), chunk_size):
-        if i + chunk_size + 3 > feature.size(1):
-            break
-        sub_feature = feature[:, i:i + chunk_size + 3, :]
-        sub_feature_lens = torch.tensor([chunk_size + 3] * feature.size(0)).to(
+    for i in range(0, feature.size(1) - 6, chunk_size):
+        end = min(i + chunk_size + 3, feature.size(1))
+        sub_feature = feature[:, i:end, :]
+        if end == feature.size(1):
+            l = feature.size(1) - i
+        else:
+            l = chunk_size + 3
+        sub_feature_lens = torch.tensor([l] * feature.size(0)).to(
             feature_lens.dtype).to(feature_lens.device)
+        left_context = states.attn_cache.size(1)
+        if left_context >= 64:
+            left_context = 64
+        states.left_context = left_context
         encoder_out, encoder_out_lens, states = model.encoder.streaming_forward2(
             x=sub_feature,
             x_lens=sub_feature_lens,
             decode_states=states,
             left_context=left_context,
         )
+        # logging.info(f"cache shape : {states.attn_cache.shape}")
+
+        # logging.info(f"offset : {states.offset}")
+        # logging.info(f"attn_cache : {states.attn_cache}")
 
         encoder_out_list.append(encoder_out)
 
@@ -488,6 +500,7 @@ def main():
 
     # <blk> is defined in local/train_bpe_model.py
     params.blank_id = sp.piece_to_id("<blk>")
+    params.unk_id = sp.piece_to_id("<unk>")
     params.vocab_size = sp.get_piece_size()
 
     logging.info(params)

@@ -194,8 +194,10 @@ class Conformer(Transformer):
             else:
                 chunk_size = chunk_size % self.short_chunk_size + 1
 
-            mask = ~subsequent_chunk_mask(
-                size=x.size(0), chunk_size=chunk_size, device=x.device)
+            mask = ~subsequent_chunk_mask(size=x.size(0),
+                                          chunk_size=chunk_size,
+                                          num_left_chunks=4,
+                                          device=x.device)
             x = self.encoder(
                 x,
                 pos_emb,
@@ -353,6 +355,7 @@ class Conformer(Transformer):
                                           decode_states.left_context)
         embed = embed.permute(1, 0, 2)  # (B, T, F) -> (T, B, F)
 
+        #x, attn_cache, conv_cache = self.encoder.chunk_forward(
         x = self.encoder.chunk_forward(
             embed,
             pos_enc,
@@ -363,6 +366,8 @@ class Conformer(Transformer):
         )  # (T, B, F)
 
         decode_states.offset += embed.size(0)
+        # decode_states.attn_cache = attn_cache
+        # decode_states.conv_cache = conv_cache
 
         if self.normalize_before:
             x = self.after_norm(x)
@@ -691,6 +696,8 @@ class ConformerEncoder(nn.TransformerEncoder):
         """
         output = src
 
+        e_cache_list = []
+        c_cache_list = []
         for layer_index, mod in enumerate(self.layers):
             output, e_cache, c_cache = mod.chunk_forward(
                 output,
@@ -701,15 +708,17 @@ class ConformerEncoder(nn.TransformerEncoder):
                 conv_cache=conv_cache[layer_index],
                 offset=offset,
             )
-            encoder_cache[layer_index, ...] = e_cache[-64:, :, :]
-            conv_cache[layer_index, ...] = c_cache[-64:, :, :]
-            # encoder_cache[layer_index] = e_cache
-            # conv_cache[layer_index] = c_cache
+            # e_cache_list.append(e_cache[-64:, ...])
+            # c_cache_list.append(c_cache[-64:, ...])
+            encoder_cache[layer_index, ...] = e_cache[-64:, ...]
+            conv_cache[layer_index, ...] = c_cache[-64:, ...]
+        # encoder_cache = torch.stack(e_cache_list, dim=0)
+        # conv_cache = torch.stack(c_cache_list, dim=0)
 
         if self.norm is not None:
             output = self.norm(output)
 
-        return output
+        return output  #, encoder_cache, conv_cache
 
 
 class RelPositionalEncoding(torch.nn.Module):
@@ -802,6 +811,15 @@ class RelPositionalEncoding(torch.nn.Module):
 
         # pos_enc shape : (2 * l - 1, dim)
         l = left_context + x.size(1)
+
+        if True:
+            pos_enc = self.pe[:,
+                              self.pe.size(1) // 2 - l +
+                              1:self.pe.size(1) // 2  # noqa E203
+                              + l, ]
+
+            return self.dropout(x), self.dropout(pos_enc)
+
         offset = offset + x.size(1)
 
         central_index = torch.tensor(self.pe.size(1) // 2,
@@ -811,14 +829,13 @@ class RelPositionalEncoding(torch.nn.Module):
         neg_index = offset.expand((offset.size(0), l - 1))
         neg_index = central_index - neg_index
         neg_index = neg_index + torch.arange(
-            l - 1, dtype=offset.dtype, device=offset.device)
+            1, l, dtype=offset.dtype, device=offset.device)
 
-        pos_index = offset.expand((offset.size(0), l - 1))
+        pos_index = offset.expand((offset.size(0), l))
         pos_index = central_index + pos_index
         pos_index = pos_index - torch.arange(
-            l - 2, -1, -1, dtype=offset.dtype, device=offset.device)
-        index = torch.cat([neg_index, central_index, pos_index],
-                          dim=1).to(torch.int64)
+            l, 0, -1, dtype=offset.dtype, device=offset.device)
+        index = torch.cat([neg_index, pos_index], dim=1).to(torch.int64)
 
         pos_enc = torch.gather(input=self.pe.expand(
             (offset.size(0), self.pe.size(1), self.pe.size(2))),
