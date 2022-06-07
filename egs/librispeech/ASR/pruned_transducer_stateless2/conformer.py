@@ -86,6 +86,7 @@ class Conformer(EncoderInterface):
         short_chunk_size: int = 25,
         num_left_chunks: int = -1,
         causal: bool = False,
+        middle_output_layer: int = None,  # 0-based layer index
     ) -> None:
         super(Conformer, self).__init__()
 
@@ -121,12 +122,27 @@ class Conformer(EncoderInterface):
             cnn_module_kernel,
             causal,
         )
-        self.encoder = ConformerEncoder(encoder_layer, num_encoder_layers)
+
+        output_layers = []
+        if middle_output_layer is not None:
+            assert (
+                middle_output_layer >= 0
+                and middle_output_layer < num_encoder_layers
+            )
+            output_layers.append(middle_output_layer)
+
+        # The last layer is always needed.
+        output_layers.append(num_encoder_layers - 1)
+
+        self.encoder = ConformerEncoder(
+            encoder_layer, num_encoder_layers, output_layers=output_layers
+        )
+
         self._init_state: List[torch.Tensor] = [torch.empty(0)]
 
     def forward(
         self, x: torch.Tensor, x_lens: torch.Tensor, warmup: float = 1.0
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """
         Args:
           x:
@@ -176,7 +192,7 @@ class Conformer(EncoderInterface):
                 num_left_chunks=self.num_left_chunks,
                 device=x.device,
             )
-            x = self.encoder(
+            layer_results = self.encoder(
                 x,
                 pos_emb,
                 mask=mask,
@@ -184,7 +200,7 @@ class Conformer(EncoderInterface):
                 warmup=warmup,
             )  # (T, N, C)
         else:
-            x = self.encoder(
+            layer_results = self.encoder(
                 x,
                 pos_emb,
                 mask=None,
@@ -192,8 +208,7 @@ class Conformer(EncoderInterface):
                 warmup=warmup,
             )  # (T, N, C)
 
-        x = x.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
-        return x, lengths
+        return layer_results, lengths
 
     @torch.jit.export
     def get_init_state(
@@ -647,12 +662,18 @@ class ConformerEncoder(nn.Module):
         >>> out = conformer_encoder(src, pos_emb)
     """
 
-    def __init__(self, encoder_layer: nn.Module, num_layers: int) -> None:
+    def __init__(
+        self,
+        encoder_layer: nn.Module,
+        num_layers: int,
+        output_layers: List[int],
+    ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
             [copy.deepcopy(encoder_layer) for i in range(num_layers)]
         )
         self.num_layers = num_layers
+        self.output_layers = output_layers
 
     def forward(
         self,
@@ -661,7 +682,7 @@ class ConformerEncoder(nn.Module):
         mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
         warmup: float = 1.0,
-    ) -> Tensor:
+    ) -> List[Tensor]:
         r"""Pass the input through the encoder layers in turn.
 
         Args:
@@ -682,6 +703,7 @@ class ConformerEncoder(nn.Module):
         """
         output = src
 
+        layer_results = []
         for layer_index, mod in enumerate(self.layers):
             output = mod(
                 output,
@@ -690,8 +712,11 @@ class ConformerEncoder(nn.Module):
                 src_key_padding_mask=src_key_padding_mask,
                 warmup=warmup,
             )
+            if layer_index in self.output_layers:
+                # (T, N, C) --> (N, T, C)
+                layer_results.append(output.permute(1, 0, 2))
 
-        return output
+        return layer_results
 
     @torch.jit.export
     def chunk_forward(
