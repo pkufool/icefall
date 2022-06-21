@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import warnings
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -24,6 +25,142 @@ from model import Transducer
 
 from icefall.decode import Nbest, one_best_decoding
 from icefall.utils import get_texts
+
+
+def fast_beam_search_with_lg_rescoring(
+    model: Transducer,
+    decoding_graph: k2.Fsa,
+    lg_graph: k2.Fsa,
+    encoder_out: torch.Tensor,
+    encoder_out_lens: torch.Tensor,
+    beam: float,
+    max_states: int,
+    max_contexts: int,
+    use_max: bool,
+) -> List[List[int]]:
+    """It limits the maximum number of symbols per frame to 1.
+
+    A lattice is first obtained using modified beam search, and then
+    the shortest path within the lattice is used as the final output.
+
+    Args:
+      model:
+        An instance of `Transducer`.
+      decoding_graph:
+        Decoding graph used for decoding, may be a TrivialGraph or a HLG.
+      encoder_out:
+        A tensor of shape (N, T, C) from the encoder.
+      encoder_out_lens:
+        A tensor of shape (N,) containing the number of frames in `encoder_out`
+        before padding.
+      beam:
+        Beam value, similar to the beam used in Kaldi..
+      max_states:
+        Max states per stream per frame.
+      max_contexts:
+        Max contexts pre stream per frame.
+    Returns:
+      Return the decoded result.
+    """
+    lattice = fast_beam_search(
+        model=model,
+        decoding_graph=decoding_graph,
+        encoder_out=encoder_out,
+        encoder_out_lens=encoder_out_lens,
+        beam=beam,
+        max_states=max_states,
+        max_contexts=max_contexts,
+    )
+
+    lattice = k2.invert(lattice)
+
+    b_to_a_map = torch.zeros(
+        lattice.shape[0],
+        dtype=torch.int32,
+        device=lattice.device,
+    )
+
+    rescored_lattice, arc_map_a, arc_map_b = k2.intersect_device(
+        a_fsas=lg_graph,
+        b_fsas=lattice,
+        b_to_a_map=b_to_a_map,
+        sorted_match_a=True,
+        ret_arc_maps=True,
+    )
+
+    # old_lm_scores = torch.index_select(lattice.scores, 0, arc_map_b)
+    # lattice.scores = lattice.scores.index_add(0, arc_map_b, -old_lm_scores)
+
+    # new_lm_scores = torch.index_select(lg_graph.scores, 0, arc_map_a)
+    new_lm_scores = torch.tensor(0.05, dtype=torch.float32, device=arc_map_a.device).expand(arc_map_a.numel())
+
+    # lm_scores = torch.logaddexp(old_lm_scores, new_lm_scores)
+    # lattice.scores = lattice.scores.index_put((arc_map_b.to(torch.int64),), lm_scores)
+    lattice.scores = lattice.scores.index_add(0, arc_map_b, new_lm_scores)
+
+    lattice = k2.invert(lattice)
+
+    if use_max:
+        best_path = one_best_decoding(lattice)
+        hyps = get_texts(best_path)
+        return hyps
+    else:
+        num_paths = 200
+        use_double_scores = True
+        nbest_scale = 0.8
+
+        nbest = Nbest.from_lattice(
+            lattice=lattice,
+            num_paths=num_paths,
+            use_double_scores=use_double_scores,
+            nbest_scale=nbest_scale,
+        )
+        # The following code is modified from nbest.intersect()
+        word_fsa = k2.invert(nbest.fsa)
+        if hasattr(lattice, "aux_labels"):
+            # delete token IDs as it is not needed
+            del word_fsa.aux_labels
+        word_fsa.scores.zero_()
+
+        word_fsa_with_epsilon_loops = k2.linear_fsa_with_self_loops(word_fsa)
+        path_to_utt_map = nbest.shape.row_ids(1)
+
+        if hasattr(lattice, "aux_labels"):
+            # lattice has token IDs as labels and word IDs as aux_labels.
+            # inv_lattice has word IDs as labels and token IDs as aux_labels
+            inv_lattice = k2.invert(lattice)
+            inv_lattice = k2.arc_sort(inv_lattice)
+        else:
+            inv_lattice = k2.arc_sort(lattice)
+
+        if inv_lattice.shape[0] == 1:
+            path_lattice = k2.intersect_device(
+                inv_lattice,
+                word_fsa_with_epsilon_loops,
+                b_to_a_map=torch.zeros_like(path_to_utt_map),
+                sorted_match_a=True,
+            )
+        else:
+            path_lattice = k2.intersect_device(
+                inv_lattice,
+                word_fsa_with_epsilon_loops,
+                b_to_a_map=path_to_utt_map,
+                sorted_match_a=True,
+            )
+
+        # path_lattice has word IDs as labels and token IDs as aux_labels
+        path_lattice = k2.top_sort(k2.connect(path_lattice))
+
+        tot_scores = path_lattice.get_tot_scores(
+            use_double_scores=use_double_scores, log_semiring=True
+        )
+
+        ragged_tot_scores = k2.RaggedTensor(nbest.shape, tot_scores)
+        best_hyp_indexes = ragged_tot_scores.argmax()
+
+        best_path = k2.index_fsa(nbest.fsa, best_hyp_indexes)
+        hyps = get_texts(best_path)
+        return hyps
 
 
 def fast_beam_search_one_best(

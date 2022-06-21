@@ -71,6 +71,7 @@ from asr_datamodule import LibriSpeechAsrDataModule
 from beam_search import (
     beam_search,
     fast_beam_search_one_best,
+    fast_beam_search_with_lg_rescoring,
     greedy_search,
     greedy_search_batch,
     modified_beam_search,
@@ -151,6 +152,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--lang-dir",
+        type=str,
+        default="data/lang_bpe_500",
+        help="Path to the BPE model",
+    )
+
+    parser.add_argument(
         "--decoding-method",
         type=str,
         default="greedy_search",
@@ -179,6 +187,20 @@ def get_parser():
         search (i.e., `cutoff = max-score - beam`), which is the same as the
         `beam` in Kaldi.
         Used only when --decoding-method is fast_beam_search""",
+    )
+
+    parser.add_argument(
+        "--ngram-lm-scale",
+        type=float,
+        default=0.1,
+        help=""
+    )
+
+    parser.add_argument(
+        "--lg-scale",
+        type=float,
+        default=0.01,
+        help=""
     )
 
     parser.add_argument(
@@ -220,7 +242,9 @@ def decode_one_batch(
     model: nn.Module,
     sp: spm.SentencePieceProcessor,
     batch: dict,
+    word_table,
     decoding_graph: Optional[k2.Fsa] = None,
+    lg_graph: Optional[k2.Fsa] = None,
 ) -> Dict[str, List[List[str]]]:
     """Decode one batch and return the result in a dict. The dict has the
     following format:
@@ -266,7 +290,7 @@ def decode_one_batch(
     hyps = []
 
     if params.decoding_method == "fast_beam_search":
-        hyp_tokens = fast_beam_search_one_best(
+        hyp_tokens = fast_beam_search_with_lg_rescoring(
             model=model,
             decoding_graph=decoding_graph,
             encoder_out=encoder_out,
@@ -274,9 +298,13 @@ def decode_one_batch(
             beam=params.beam,
             max_contexts=params.max_contexts,
             max_states=params.max_states,
+            lg_graph=lg_graph,
+            use_max=False,
         )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
+        for hyp in hyp_tokens:
+            hyps.append([word_table[i] for i in hyp])
+        # for hyp in sp.decode(hyp_tokens):
+            # hyps.append(hyp.split())
     elif (
         params.decoding_method == "greedy_search"
         and params.max_sym_per_frame == 1
@@ -341,7 +369,9 @@ def decode_dataset(
     params: AttributeDict,
     model: nn.Module,
     sp: spm.SentencePieceProcessor,
+    word_table,
     decoding_graph: Optional[k2.Fsa] = None,
+    lg_graph: Optional[k2.Fsa] = None,
 ) -> Dict[str, List[Tuple[List[str], List[str]]]]:
     """Decode dataset.
 
@@ -386,6 +416,8 @@ def decode_dataset(
             sp=sp,
             decoding_graph=decoding_graph,
             batch=batch,
+            lg_graph=lg_graph,
+            word_table=word_table,
         )
 
         for name, hyps in hyps_dict.items():
@@ -411,7 +443,7 @@ def decode_dataset(
 def save_results(
     params: AttributeDict,
     test_set_name: str,
-    results_dict: Dict[str, List[Tuple[List[int], List[int]]]],
+    results_dict: Dict[str, List[Tuple[List[str], List[str]]]],
 ):
     test_set_wers = dict()
     for key, results in results_dict.items():
@@ -450,6 +482,72 @@ def save_results(
         s += "{}\t{}{}\n".format(key, val, note)
         note = ""
     logging.info(s)
+
+
+def load_ngram_LM(
+    lm_dir: Path, word_table: k2.SymbolTable, device: torch.device
+) -> k2.Fsa:
+    """Read a ngram model from the given directory.
+    Args:
+      lm_dir:
+        It should contain either G_4_gram.pt or G_4_gram.fst.txt
+      word_table:
+        The word table mapping words to IDs and vice versa.
+      device:
+        The resulting FSA will be moved to this device.
+    Returns:
+      Return an FsaVec containing a single acceptor.
+    """
+    lm_dir = Path(lm_dir)
+    assert lm_dir.is_dir(), f"{lm_dir} does not exist"
+
+    pt_file = lm_dir / "G_4_gram.pt"
+
+    if pt_file.is_file():
+        logging.info(f"Loading pre-compiled {pt_file}")
+        d = torch.load(pt_file, map_location="cpu")
+        G = k2.Fsa.from_dict(d)
+        G = k2.add_epsilon_self_loops(G)
+        G = k2.arc_sort(G)
+        G = G.to(device)
+        return G
+
+    txt_file = lm_dir / "G_4_gram.fst.txt"
+
+    assert txt_file.is_file(), f"{txt_file} does not exist"
+    logging.info(f"Loading {txt_file}")
+    logging.warning("It may take 8 minutes (Will be cached for later use).")
+    with open(txt_file) as f:
+        G = k2.Fsa.from_openfst(f.read(), acceptor=False)
+
+        # G.aux_labels is not needed in later computations, so
+        # remove it here.
+        del G.aux_labels
+        # Now G is an acceptor
+
+        first_word_disambig_id = word_table["#0"]
+        # CAUTION: The following line is crucial.
+        # Arcs entering the back-off state have label equal to #0.
+        # We have to change it to 0 here.
+        G.labels[G.labels >= first_word_disambig_id] = 0
+
+        # See https://github.com/k2-fsa/k2/issues/874
+        # for why we need to set G.properties to None
+        G.__dict__["_properties"] = None
+
+        G = k2.Fsa.from_fsas([G]).to(device)
+
+        # Save a dummy value so that it can be loaded in C++.
+        # See https://github.com/pytorch/pytorch/issues/67902
+        # for why we need to do this.
+        G.dummy = 1
+
+        logging.info(f"Saving to {pt_file} for later use")
+        torch.save(G.as_dict(), pt_file)
+
+        G = k2.add_epsilon_self_loops(G)
+        G = k2.arc_sort(G)
+        return G
 
 
 @torch.no_grad()
@@ -593,9 +691,36 @@ def main():
     model.eval()
 
     if params.decoding_method == "fast_beam_search":
-        decoding_graph = k2.trivial_graph(params.vocab_size - 1, device=device)
+
+        decoding_graph = k2.Fsa.from_dict(
+            torch.load(f"{params.lang_dir}/LG.pt", map_location=device)
+        )
+        decoding_graph.scores *= params.lg_scale
+        decoding_graph.lm_scores = decoding_graph.scores
+        # decoding_graph = k2.trivial_graph(params.vocab_size - 1, device=device)
     else:
         decoding_graph = None
+
+    lm_dir = Path(params.lang_dir)
+    word_table = k2.SymbolTable.from_file(lm_dir / "words.txt")
+    G = load_ngram_LM(
+        lm_dir="exp/exp/lang_err",
+        word_table=word_table,
+        device=device,
+    )
+    lg_graph = G
+    lg_graph.scores *= params.ngram_lm_scale
+
+    #lg_graph = k2.Fsa.from_dict(
+    #    # torch.load(f"{params.lang_dir}/LG.pt", map_location=device)
+    #    torch.load(f"exp/exp/lang_err/LG.pt", map_location=device)
+    #)
+    #lg_graph = k2.Fsa.from_fsas([lg_graph])
+    #del lg_graph.aux_labels
+
+    #lg_graph = k2.add_epsilon_self_loops(lg_graph)
+    #lg_graph = k2.arc_sort(lg_graph)
+    #lg_graph.scores *= params.ngram_lm_scale
 
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
@@ -618,6 +743,8 @@ def main():
             model=model,
             sp=sp,
             decoding_graph=decoding_graph,
+            lg_graph=lg_graph,
+            word_table=word_table,
         )
 
         save_results(
