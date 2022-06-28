@@ -26,7 +26,7 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3"
   --world-size 4 \
   --num-epochs 30 \
   --start-epoch 1 \
-  --exp-dir pruned_transducer_stateless2/exp \
+  --exp-dir pruned_transducer_stateless4/exp \
   --full-libri 1 \
   --max-duration 300
 
@@ -37,7 +37,7 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3"
   --num-epochs 30 \
   --start-epoch 1 \
   --use-fp16 1 \
-  --exp-dir pruned_transducer_stateless2/exp \
+  --exp-dir pruned_transducer_stateless4/exp \
   --full-libri 1 \
   --max-duration 550
 
@@ -74,9 +74,10 @@ from asr_datamodule import LibriSpeechAsrDataModule
 from conformer import Conformer
 from decoder import Decoder
 from joiner import Joiner
-from lhotse.cut import Cut
+from lhotse.cut import Cut, MonoCut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
+from lhotse.dataset.collation import collate_custom_field
 from model import Transducer
 from optim import Eden, Eve
 from torch import Tensor
@@ -272,6 +273,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--codebook-loss-scale",
+        type=float,
+        default=0.1,
+        help="The scale of codebook loss.",
+    )
+
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -402,6 +410,13 @@ def get_params() -> AttributeDict:
             # parameters for Noam
             "model_warm_step": 3000,  # arg given to model, not for lrate
             "env_info": get_env_info(),
+            # parameters for distillation with codebook indexes.
+            "enable_distiallation": True,
+            "distillation_layer": 5,  # 0-based index
+            # Since output rate of hubert is 50, while that of encoder is 8,
+            # two successive codebook_index are concatenated together.
+            # Detailed in function Transducer::concat_sucessive_codebook_indexes.
+            "num_codebooks": 16,  # used to construct distillation loss
         }
     )
 
@@ -421,6 +436,9 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
         short_chunk_size=params.short_chunk_size,
         num_left_chunks=params.num_left_chunks,
         causal=params.causal_convolution,
+        middle_output_layer=params.distillation_layer
+        if params.enable_distiallation
+        else None,
     )
     return encoder
 
@@ -458,6 +476,9 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
+        num_codebooks=params.num_codebooks
+        if params.enable_distiallation
+        else 0,
     )
     return model
 
@@ -581,6 +602,18 @@ def save_checkpoint(
         copyfile(src=filename, dst=best_valid_filename)
 
 
+def extract_codebook_indexes(batch):
+    cuts = batch["supervisions"]["cut"]
+    # -100 is identical to ignore_value in CE loss computation.
+    cuts_pre_mixed = [
+        c if isinstance(c, MonoCut) else c.tracks[0].cut for c in cuts
+    ]
+    codebook_indexes, codebook_indexes_lens = collate_custom_field(
+        cuts_pre_mixed, "codebook_indexes", pad_value=-100
+    )
+    return codebook_indexes, codebook_indexes_lens
+
+
 def compute_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
@@ -624,8 +657,15 @@ def compute_loss(
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
+    info = MetricsTracker()
+    if is_training and params.enable_distiallation:
+        codebook_indexes, _ = extract_codebook_indexes(batch)
+        codebook_indexes = codebook_indexes.to(device)
+    else:
+        codebook_indexes = None
+
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss = model(
+        simple_loss, pruned_loss, codebook_loss = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
@@ -633,6 +673,7 @@ def compute_loss(
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
             warmup=warmup,
+            codebook_indexes=codebook_indexes,
         )
         # after the main warmup step, we keep pruned_loss_scale small
         # for the same amount of time (model_warm_step), to avoid
@@ -647,10 +688,12 @@ def compute_loss(
             params.simple_loss_scale * simple_loss
             + pruned_loss_scale * pruned_loss
         )
+        if is_training and params.enable_distiallation:
+            assert codebook_loss is not None
+            loss += params.codebook_loss_scale * codebook_loss
 
     assert loss.requires_grad == is_training
 
-    info = MetricsTracker()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         info["frames"] = (
@@ -661,6 +704,8 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    if is_training and params.enable_distiallation:
+        info["codebook_loss"] = codebook_loss.detach().cpu().item()
 
     return loss, info
 
