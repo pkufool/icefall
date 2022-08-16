@@ -1,4 +1,4 @@
-# Copyright    2021  Xiaomi Corp.        (authors: Fangjun Kuang, Wei Kang)
+# Copyright    2022  Xiaomi Corp.        (author: Wei Kang)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -16,24 +16,59 @@
 
 
 import k2
+import logging
 import torch
 import torch.nn as nn
+from torch.distributions.categorical import Categorical
 from encoder_interface import EncoderInterface
 from scaling import ScaledLinear
+from typing import Tuple
 
 from icefall.utils import add_sos
 
+def _roll_by_shifts(
+    src: torch.Tensor, shifts: torch.LongTensor
+) -> torch.Tensor:
+    """Roll tensor with different shifts for each row.
+    Note:
+      We assume the src is a 3 dimensions tensor and roll the last dimension.
+    Example:
+      >>> src = torch.arange(15).reshape((1,3,5))
+      >>> src
+      tensor([[[ 0,  1,  2,  3,  4],
+               [ 5,  6,  7,  8,  9],
+               [10, 11, 12, 13, 14]]])
+      >>> shift = torch.tensor([[1, 2, 3]])
+      >>> shift
+      tensor([[1, 2, 3]])
+      >>> _roll_by_shifts(src, shift)
+      tensor([[[ 4,  0,  1,  2,  3],
+               [ 8,  9,  5,  6,  7],
+               [12, 13, 14, 10, 11]]])
+    """
+    assert src.dim() == 3
+    (B, T, S) = src.shape
+    assert shifts.shape == (B, T)
+
+    index = (
+        torch.arange(S, device=src.device)
+        .view((1, S))
+        .repeat((T, 1))
+        .repeat((B, 1, 1))
+    )
+    index = (index - shifts.reshape(B, T, 1)) % S
+    return torch.gather(src, 2, index)
+
 
 class Transducer(nn.Module):
-    """It implements https://arxiv.org/pdf/1211.3711.pdf
-    "Sequence Transduction with Recurrent Neural Networks"
-    """
-
     def __init__(
         self,
         encoder: EncoderInterface,
-        decoder: nn.Module,
-        joiner: nn.Module,
+        hybrid_decoder: nn.Module,
+        hybrid_joiner: nn.Module,
+        predictor_decoder: nn.Module,
+        predictor_joiner: nn.Module,
+        external_lm: nn.Module,
         encoder_dim: int,
         decoder_dim: int,
         joiner_dim: int,
@@ -42,32 +77,252 @@ class Transducer(nn.Module):
         """
         Args:
           encoder:
-            It is the transcription network in the paper. Its accepts
+            The shared transcription network. Its accepts
             two inputs: `x` of (N, T, encoder_dim) and `x_lens` of shape (N,).
             It returns two tensors: `logits` of shape (N, T, encoder_dm) and
             `logit_lens` of shape (N,).
-          decoder:
-            It is the prediction network in the paper. Its input shape
+          hybrid_decoder:
+            The prediction network of hybrid head. Its input shape
             is (N, U) and its output shape is (N, U, decoder_dim).
             It should contain one attribute: `blank_id`.
-          joiner:
+          hybrid_joiner:
             It has two inputs with shapes: (N, T, encoder_dim) and
             (N, U, decoder_dim).
             Its output shape is (N, T, U, vocab_size). Note that its output
             contains unnormalized probs, i.e., not processed by log-softmax.
+          predictor_decoder:
+            The prediction network of predictor head. Its input shape
+            is (N, U) and its output shape is (N, U, decoder_dim).
+            It should contain one attribute: `blank_id`.
+          predictor_joiner:
+            It has two inputs with shapes: (N, T, encoder_dim) and
+            (N, U, decoder_dim).
+            Its output shape is (N, T, U, vocab_size). Note that its output
+            contains unnormalized probs, i.e., not processed by log-softmax.
+          external_lm:
+            The external language model which is just an embedding layer plus
+            a convolution layer. Its input shape
+            is (N, U) and its output shape is (N, U, decoder_dim).
+            It should contain one attribute: `blank_id`.
+          encoder_dim:
+            The output dimension of encoder.
+          decoder_dim:
+            The output dimension of decoder.
+          joiner_dim:
+            The output dimension of joiner.
+          vocab_size:
+            The vocabulary size.
         """
         super().__init__()
         assert isinstance(encoder, EncoderInterface), type(encoder)
-        assert hasattr(decoder, "blank_id")
+        assert hasattr(hybrid_decoder, "blank_id")
+        assert hasattr(predictor_decoder, "blank_id")
+        assert hasattr(external_lm, "blank_id")
 
         self.encoder = encoder
-        self.decoder = decoder
-        self.joiner = joiner
+        self.hybrid_decoder = hybrid_decoder
+        self.hybrid_joiner = hybrid_joiner
+        self.predictor_decoder = predictor_decoder
+        self.predictor_joiner = predictor_joiner
+        self.external_lm = external_lm
 
         self.simple_am_proj = ScaledLinear(
             encoder_dim, vocab_size, initial_speed=0.5
         )
-        self.simple_lm_proj = ScaledLinear(decoder_dim, vocab_size)
+        self.simple_predictor_lm_proj = ScaledLinear(decoder_dim, vocab_size)
+        self.external_lm_proj = ScaledLinear(decoder_dim, vocab_size)
+
+    def importance_sampling(
+        self,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        path_length: int,
+        num_paths: int,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """
+        Args:
+          encoder_out:
+            The output of the encoder whose shape is (batch_size, T, encoder_dim)
+          encoder_out_lens:
+            A tensor of shape (batch_size,) containing the number of frames
+            before padding.
+          path_length:
+            How many symbols we will sample for each path.
+          num_paths:
+            How many paths we will sample for each sequence.
+        Returns:
+          Five tensors will be returned.
+          - sampled_paths:
+            A tensor of shape (batch_size, num_paths, path_length), containing the
+            sampled symbol ids.
+          - sampling_probs:
+            A tensor of shape (batch_size, num_paths, path_length), containing the
+            sampling probabilities of the sampled symbols.
+          - path_scores:
+            A tensor of shape (batch_size, num_paths, path_length), containing the
+            scores of the sampled paths, the scores include joiner output and
+            external_lm output.
+          - left_symbols:
+            A tensor of shape (batch_size, num_paths, path_length, context_size),
+            containing the left symbols of the sampled symbols.
+          - frame_ids:
+            A tensor of shape (batch_size, num_paths, path_length), containing the
+            frame ids at which we sampled the symbols.
+        """
+        batch_size, T, encoder_dim = encoder_out.shape
+        device = encoder_out.device
+
+        blank_id = self.predictor_decoder.blank_id
+        assert blank_id == self.hybrid_decoder.blank_id
+
+        context_size = self.predictor_decoder.context_size
+        assert context_size == self.hybrid_decoder.context_size
+
+        decoder_dim = self.predictor_decoder.decoder_dim
+        assert decoder_dim == self.hybrid_decoder.decoder_dim
+
+        # we sample paths from frame 0
+        t_index = torch.zeros(
+            (batch_size, num_paths), dtype=torch.int64, device=device
+        )
+
+        # The max frame index for each path
+        t_index_max = encoder_out_lens.view(batch_size, 1).expand(batch_size, num_paths)
+
+        # The left_symbols for each path
+        left_symbols = torch.tensor(
+            [blank_id], dtype=torch.int64, device=device
+        ).expand(batch_size * num_paths, context_size)
+
+        sampled_paths_list = []
+        sampling_probs_list = []
+        path_scores_list = []
+        frame_ids_list = []
+        left_symbols_list = []
+
+        for i in range(path_length):
+            # (B, num_paths, encoder_dim)
+            current_encoder_out = torch.gather(
+                encoder_out,
+                dim=1,
+                index=t_index.unsqueeze(2).expand(
+                    batch_size, num_paths, encoder_dim
+                ),
+            )
+
+            # (B, num_paths, decoder_dim)
+            predictor_decoder_output = self.predictor_decoder(
+                left_symbols, need_pad=False
+            ).view(batch_size, num_paths, decoder_dim)
+            # (B, num_paths, V)
+            predictor_joiner_output = self.predictor_joiner(
+                current_encoder_out, predictor_decoder_output
+            )
+
+            # (B, num_paths, decoder_dim)
+            hybrid_decoder_output = self.hybrid_decoder(
+                left_symbols, need_pad=False
+            ).view(batch_size, num_paths, decoder_dim)
+            # (B, num_paths, V)
+            hybrid_joiner_output = self.hybrid_joiner(
+                current_encoder_out, predictor_decoder_output
+            )
+
+            # (B, num_paths, decoder_dim)
+            external_lm_output = self.external_lm(
+                left_symbols, need_pad=False
+            ).view(batch_size, num_paths, decoder_dim)
+            # (B, num_paths, V)
+            external_lm_output = self.external_lm_proj(external_lm_output)
+
+            probs = torch.softmax(predictor_joiner_output, -1)
+            # sampler: https://pytorch.org/docs/stable/distributions.html#categorical
+            sampler = Categorical(probs=probs)
+
+            # sample one symbol for each path
+            # index : (batch_size, num_paths)
+            index = sampler.sample()
+            sampled_paths_list.append(index)
+
+            frame_ids_list.append(t_index)
+            # update (t, s) for each path
+            # index == 0 means the sampled symbol is blank
+            t_mask = index == 0
+            # t_index = torch.where(t_mask, t_index + 1, t_index)
+            t_index = t_index + 1
+
+            final_mask = t_index >= t_index_max
+            reach_final = torch.any(final_mask)
+            if reach_final:
+                new_t_index = torch.randint(1, torch.min(t_index_max) - 1, (1,)).item()
+                t_index.masked_fill_(final_mask, new_t_index)
+
+            left_symbols = left_symbols.view(batch_size, num_paths, context_size)
+            left_symbols_list.append(left_symbols)
+            current_symbols = torch.cat(
+                [
+                    left_symbols,
+                    index.unsqueeze(2),
+                ],
+                dim=2,
+            )
+            left_symbols = _roll_by_shifts(
+                current_symbols, t_mask.to(torch.int64)
+            )
+            left_symbols = left_symbols[:, :, 1:]
+            if reach_final:
+                left_symbols.masked_fill_(final_mask.unsqueeze(2), blank_id)
+
+            left_symbols = left_symbols.view(
+                batch_size * num_paths, context_size
+            )
+
+            # gather sampling probabilities for corresponding indexs
+            # sampling_prob : (batch_size, num_paths, 1)
+            sampling_probs = torch.gather(
+                probs, dim=2, index=index.unsqueeze(2)
+            )
+            sampling_probs = torch.clamp(sampling_probs, min=1e-5, max=1-(1e-5))
+
+            sampling_probs_list.append(sampling_probs.squeeze(2))
+
+            # (B, num_paths, 1)
+            hybrid_scores = torch.gather(
+                hybrid_joiner_output, dim=2, index=index.unsqueeze(2)
+            )
+
+            # (B, num_paths, 1)
+            lm_scores = torch.gather(
+                external_lm_output, dim=2, index=index.unsqueeze(2)
+            )
+
+            # blank arcs do not have lm scores
+            # can we set it to 0.0?
+            lm_scores.masked_fill_(mask=t_mask.unsqueeze(2), value=0.0)
+            # detach lm_scoers, we only train external_lm module with NUM loss
+            # TODO(Wei Kang): Add external language model
+            path_scores = hybrid_scores # + lm_scores.detach()
+            path_scores_list.append(path_scores)
+
+        # sampled_paths : (batch_size, num_paths, path_lengths)
+        sampled_paths = torch.stack(sampled_paths_list, dim=2).int()
+        # sampling_probs : (batch_size, num_paths, path_lengths)
+        sampling_probs = torch.stack(sampling_probs_list, dim=2)
+        # path_scores : (batch_size, num_paths, path_lengths)
+        path_scores = torch.stack(path_scores_list, dim=2)
+        # frame_ids : (batch_size , num_paths, path_lengths)
+        frame_ids = torch.stack(frame_ids_list, dim=2).int()
+        # left_symbols : (batch_size, num_paths, path_lengths, context_size)
+        left_symbols = torch.stack(left_symbols_list, dim=2).int()
+        return (
+            sampled_paths,
+            frame_ids,
+            sampling_probs,
+            path_scores,
+            left_symbols,
+        )
 
     def forward(
         self,
@@ -75,6 +330,8 @@ class Transducer(nn.Module):
         x_lens: torch.Tensor,
         y: k2.RaggedTensor,
         prune_range: int = 5,
+        path_length: int = 25,
+        num_paths_per_frame: int = 10,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
         warmup: float = 1.0,
@@ -92,6 +349,12 @@ class Transducer(nn.Module):
           prune_range:
             The prune range for rnnt loss, it means how many symbols(context)
             we are considering for each frame to compute the loss.
+          path_length:
+            How many symbols (including blank symbol) will be sampled for a
+            linear path.
+          num_paths_per_frame:
+            How many linear paths will be sampled when generating the
+            denominator lattice.
           am_scale:
             The scale to smooth the loss with am (output of encoder network)
             part
@@ -116,6 +379,7 @@ class Transducer(nn.Module):
 
         assert x.size(0) == x_lens.size(0) == y.dim0
 
+        # encoder_out : [B, T, encoder_dim]
         encoder_out, x_lens = self.encoder(x, x_lens, warmup=warmup)
         assert torch.all(x_lens > 0)
 
@@ -123,14 +387,18 @@ class Transducer(nn.Module):
         row_splits = y.shape.row_splits(1)
         y_lens = row_splits[1:] - row_splits[:-1]
 
-        blank_id = self.decoder.blank_id
+        blank_id = self.predictor_decoder.blank_id
+        vocab_size = self.predictor_decoder.vocab_size
+        context_size = self.predictor_decoder.context_size
         sos_y = add_sos(y, sos_id=blank_id)
 
         # sos_y_padded: [B, S + 1], start with SOS.
         sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
 
         # decoder_out: [B, S + 1, decoder_dim]
-        decoder_out = self.decoder(sos_y_padded)
+        predictor_decoder_out = self.predictor_decoder(sos_y_padded)
+        hybrid_decoder_out = self.hybrid_decoder(sos_y_padded)
+        external_lm_out = self.external_lm(sos_y_padded)
 
         # Note: y does not start with SOS
         # y_padded : [B, S]
@@ -143,12 +411,12 @@ class Transducer(nn.Module):
         boundary[:, 2] = y_lens
         boundary[:, 3] = x_lens
 
-        lm = self.simple_lm_proj(decoder_out)
+        predictor_lm = self.simple_predictor_lm_proj(predictor_decoder_out)
         am = self.simple_am_proj(encoder_out)
 
         with torch.cuda.amp.autocast(enabled=False):
-            simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
-                lm=lm.float(),
+            predictor_simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
+                lm=predictor_lm.float(),
                 am=am.float(),
                 symbols=y_padded,
                 termination_symbol=blank_id,
@@ -170,20 +438,22 @@ class Transducer(nn.Module):
         # am_pruned : [B, T, prune_range, encoder_dim]
         # lm_pruned : [B, T, prune_range, decoder_dim]
         am_pruned, lm_pruned = k2.do_rnnt_pruning(
-            am=self.joiner.encoder_proj(encoder_out),
-            lm=self.joiner.decoder_proj(decoder_out),
+            am=self.predictor_joiner.encoder_proj(encoder_out),
+            lm=self.predictor_joiner.decoder_proj(predictor_decoder_out),
             ranges=ranges,
         )
 
-        # logits : [B, T, prune_range, vocab_size]
+        # predictor_logits : [B, T, prune_range, vocab_size]
 
         # project_input=False since we applied the decoder's input projections
         # prior to do_rnnt_pruning (this is an optimization for speed).
-        logits = self.joiner(am_pruned, lm_pruned, project_input=False)
+        predictor_logits = self.predictor_joiner(
+            am_pruned, lm_pruned, project_input=False
+        )
 
         with torch.cuda.amp.autocast(enabled=False):
-            pruned_loss = k2.rnnt_loss_pruned(
-                logits=logits.float(),
+            predictor_pruned_loss = k2.rnnt_loss_pruned(
+                logits=predictor_logits.float(),
                 symbols=y_padded,
                 ranges=ranges,
                 termination_symbol=blank_id,
@@ -191,4 +461,56 @@ class Transducer(nn.Module):
                 reduction="sum",
             )
 
-        return (simple_loss, pruned_loss)
+        # currently, use unpruned-rnnt to train hybrid head
+        hybrid_logits = self.hybrid_joiner(
+            encoder_out.unsqueeze(2), hybrid_decoder_out.unsqueeze(1)
+        )
+
+        # add external_lm_out
+        # TODO(Wei Kang): Add external language model
+
+        with torch.cuda.amp.autocast(enabled=False):
+            num_loss = k2.rnnt_loss_unnormalized(
+                logits=hybrid_logits,
+                symbols=y_padded,
+                termination_symbol=blank_id,
+                boundary=boundary,
+                modified=True,
+                reduction="sum",
+            )
+
+        (
+            sampled_paths,
+            frame_ids,
+            sampling_probs,
+            path_scores,
+            left_symbols,
+        ) = self.importance_sampling(
+            encoder_out=encoder_out,
+            encoder_out_lens=x_lens,
+            path_length=path_length,
+            num_paths=num_paths_per_frame,
+        )
+
+        den_lattice = k2.generate_denominator_lattice(
+            sampled_paths=sampled_paths,
+            frame_ids=frame_ids,
+            left_symbols=left_symbols,
+            sampling_probs=sampling_probs.detach(),
+            path_scores=path_scores,
+            vocab_size=vocab_size,
+            context_size=context_size,
+        )
+        den_lattice = k2.connect(k2.top_sort(den_lattice))
+
+        den_scores = den_lattice.get_tot_scores(
+            log_semiring=True, use_double_scores=True
+        )
+        den_loss = -torch.sum(den_scores)
+
+        return (
+            num_loss,
+            den_loss,
+            predictor_simple_loss,
+            predictor_pruned_loss,
+        )

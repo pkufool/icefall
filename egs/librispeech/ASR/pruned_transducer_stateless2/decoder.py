@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from typing import Union
+import logging
 
 import torch
 import torch.nn as nn
@@ -66,6 +67,7 @@ class Decoder(nn.Module):
         assert context_size >= 1, context_size
         self.context_size = context_size
         self.vocab_size = vocab_size
+        self.decoder_dim = decoder_dim
         if context_size > 1:
             self.conv = ScaledConv1d(
                 in_channels=decoder_dim,

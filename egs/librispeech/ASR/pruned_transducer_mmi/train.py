@@ -362,6 +362,24 @@ def get_parser():
         help="Whether to use half precision training.",
     )
 
+    parser.add_argument(
+        "--path-length",
+        type=int,
+        default=25,
+        help="""How many symbols will be sampled for each path when generating
+        the denominator lattice.
+        """,
+    )
+
+    parser.add_argument(
+        "--num-paths-per-frame",
+        type=int,
+        default=20,
+        help="""How many linear paths will be sampled for each sequence when
+        generating the denominator lattice.
+        """,
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -418,14 +436,14 @@ def get_params() -> AttributeDict:
             "best_train_epoch": -1,
             "best_valid_epoch": -1,
             "batch_idx_train": 0,
-            "log_interval": 50,
+            "log_interval": 1,
             "reset_interval": 200,
             "valid_interval": 3000,  # For the 100h subset, use 800
             # parameters for conformer
             "feature_dim": 80,
             "subsampling_factor": 4,
             # parameters for Noam
-            "model_warm_step": 3000,  # arg given to model, not for lrate
+            "model_warm_step": 500,  # arg given to model, not for lrate
             "env_info": get_env_info(),
         }
     )
@@ -472,13 +490,19 @@ def get_joiner_model(params: AttributeDict) -> nn.Module:
 
 def get_transducer_model(params: AttributeDict) -> nn.Module:
     encoder = get_encoder_model(params)
-    decoder = get_decoder_model(params)
-    joiner = get_joiner_model(params)
+    hybrid_decoder = get_decoder_model(params)
+    hybrid_joiner = get_joiner_model(params)
+    predictor_decoder = get_decoder_model(params)
+    predictor_joiner = get_joiner_model(params)
+    external_lm = get_decoder_model(params)
 
     model = Transducer(
         encoder=encoder,
-        decoder=decoder,
-        joiner=joiner,
+        hybrid_decoder=hybrid_decoder,
+        hybrid_joiner=hybrid_joiner,
+        predictor_decoder=predictor_decoder,
+        predictor_joiner=predictor_joiner,
+        external_lm=external_lm,
         encoder_dim=params.encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
@@ -647,11 +671,13 @@ def compute_loss(
     y = k2.RaggedTensor(y).to(device)
 
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss = model(
+        num_loss, den_loss, simple_loss, pruned_loss = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
             prune_range=params.prune_range,
+            path_length=params.path_length,
+            num_paths_per_frame=params.num_paths_per_frame,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
             warmup=warmup,
@@ -665,9 +691,11 @@ def compute_loss(
             if warmup < 1.0
             else (0.1 if warmup > 1.0 and warmup < 2.0 else 1.0)
         )
+        mmi_loss = num_loss - 0.1 * den_loss
         loss = (
             params.simple_loss_scale * simple_loss
             + pruned_loss_scale * pruned_loss
+            + pruned_loss_scale * mmi_loss
         )
 
     assert loss.requires_grad == is_training
@@ -692,6 +720,9 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    info["num_loss"] = num_loss.detach().cpu().item()
+    info["den_loss"] = den_loss.detach().cpu().item()
+    info["mmi_loss"] = mmi_loss.detach().cpu().item()
 
     return loss, info
 
