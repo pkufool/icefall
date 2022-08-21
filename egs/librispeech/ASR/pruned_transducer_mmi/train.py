@@ -443,7 +443,7 @@ def get_params() -> AttributeDict:
             "feature_dim": 80,
             "subsampling_factor": 4,
             # parameters for Noam
-            "model_warm_step": 500,  # arg given to model, not for lrate
+            "model_warm_step": 300,  # arg given to model, not for lrate
             "env_info": get_env_info(),
         }
     )
@@ -670,6 +670,10 @@ def compute_loss(
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
+    normalized = True
+    # if warmup > 3.0:
+        # normalized = False
+
     with torch.set_grad_enabled(is_training):
         num_loss, den_loss, simple_loss, pruned_loss = model(
             x=feature,
@@ -678,6 +682,7 @@ def compute_loss(
             prune_range=params.prune_range,
             path_length=params.path_length,
             num_paths_per_frame=params.num_paths_per_frame,
+            normalized=normalized,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
             warmup=warmup,
@@ -691,11 +696,16 @@ def compute_loss(
             if warmup < 1.0
             else (0.1 if warmup > 1.0 and warmup < 2.0 else 1.0)
         )
-        mmi_loss = num_loss - 0.1 * den_loss
+        den_loss_scale = (
+            0.0
+            if warmup < 2.0
+            else 0.1
+        )
+        mmi_loss = num_loss - den_loss_scale * den_loss
         loss = (
             params.simple_loss_scale * simple_loss
             + pruned_loss_scale * pruned_loss
-            + pruned_loss_scale * mmi_loss
+            + mmi_loss
         )
 
     assert loss.requires_grad == is_training

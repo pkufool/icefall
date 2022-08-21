@@ -26,6 +26,7 @@ from typing import Tuple
 
 from icefall.utils import add_sos
 
+
 def _roll_by_shifts(
     src: torch.Tensor, shifts: torch.LongTensor
 ) -> torch.Tensor:
@@ -302,8 +303,7 @@ class Transducer(nn.Module):
             # can we set it to 0.0?
             lm_scores.masked_fill_(mask=t_mask.unsqueeze(2), value=0.0)
             # detach lm_scoers, we only train external_lm module with NUM loss
-            # TODO(Wei Kang): Add external language model
-            path_scores = hybrid_scores # + lm_scores.detach()
+            path_scores = hybrid_scores + lm_scores.detach()
             path_scores_list.append(path_scores)
 
         # sampled_paths : (batch_size, num_paths, path_lengths)
@@ -332,6 +332,7 @@ class Transducer(nn.Module):
         prune_range: int = 5,
         path_length: int = 25,
         num_paths_per_frame: int = 10,
+        normalized: int = False,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
         warmup: float = 1.0,
@@ -383,6 +384,11 @@ class Transducer(nn.Module):
         encoder_out, x_lens = self.encoder(x, x_lens, warmup=warmup)
         assert torch.all(x_lens > 0)
 
+        max_len = torch.max(x_lens).item()
+
+        # TODO(Wei Kang): Remove this line when finishing debuging
+        path_length = max_len if max_len > path_length else path_length
+
         # Now for the decoder, i.e., the prediction network
         row_splits = y.shape.row_splits(1)
         y_lens = row_splits[1:] - row_splits[:-1]
@@ -399,6 +405,7 @@ class Transducer(nn.Module):
         predictor_decoder_out = self.predictor_decoder(sos_y_padded)
         hybrid_decoder_out = self.hybrid_decoder(sos_y_padded)
         external_lm_out = self.external_lm(sos_y_padded)
+        external_lm_out_proj = self.external_lm_proj(external_lm_out)
 
         # Note: y does not start with SOS
         # y_padded : [B, S]
@@ -466,16 +473,15 @@ class Transducer(nn.Module):
             encoder_out.unsqueeze(2), hybrid_decoder_out.unsqueeze(1)
         )
 
-        # add external_lm_out
-        # TODO(Wei Kang): Add external language model
-
         with torch.cuda.amp.autocast(enabled=False):
-            num_loss = k2.rnnt_loss_unnormalized(
+            num_loss = k2.rnnt_loss(
                 logits=hybrid_logits,
+                external_lm=external_lm_out_proj,
                 symbols=y_padded,
                 termination_symbol=blank_id,
                 boundary=boundary,
                 modified=True,
+                normalized=normalized,
                 reduction="sum",
             )
 
@@ -497,10 +503,12 @@ class Transducer(nn.Module):
             frame_ids=frame_ids,
             left_symbols=left_symbols,
             sampling_probs=sampling_probs.detach(),
+            boundary=x_lens,
             path_scores=path_scores,
             vocab_size=vocab_size,
             context_size=context_size,
         )
+
         den_lattice = k2.connect(k2.top_sort(den_lattice))
 
         den_scores = den_lattice.get_tot_scores(
