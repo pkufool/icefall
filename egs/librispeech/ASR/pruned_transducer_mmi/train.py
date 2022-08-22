@@ -671,11 +671,17 @@ def compute_loss(
     y = k2.RaggedTensor(y).to(device)
 
     normalized = True
-    # if warmup > 3.0:
-        # normalized = False
+    if warmup >= 6.0:
+        normalized = False
 
     with torch.set_grad_enabled(is_training):
-        num_loss, den_loss, simple_loss, pruned_loss = model(
+        (
+            hybrid_simple_loss,
+            num_loss,
+            den_loss,
+            predictor_simple_loss,
+            predictor_pruned_loss,
+        ) = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
@@ -696,15 +702,12 @@ def compute_loss(
             if warmup < 1.0
             else (0.1 if warmup > 1.0 and warmup < 2.0 else 1.0)
         )
-        den_loss_scale = (
-            0.0
-            if warmup < 2.0
-            else 0.1
-        )
-        mmi_loss = num_loss - den_loss_scale * den_loss
+        den_loss_scale = 0.0 if warmup < 3.0 else 0.1
+        mmi_loss = pruned_loss_scale * num_loss - den_loss_scale * den_loss
         loss = (
-            params.simple_loss_scale * simple_loss
-            + pruned_loss_scale * pruned_loss
+            params.simple_loss_scale * predictor_simple_loss
+            + pruned_loss_scale * predictor_pruned_loss
+            + params.simple_loss_scale * hybrid_simple_loss
             + mmi_loss
         )
 
@@ -728,8 +731,9 @@ def compute_loss(
 
     # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
-    info["simple_loss"] = simple_loss.detach().cpu().item()
-    info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    info["predictor_simple_loss"] = predictor_simple_loss.detach().cpu().item()
+    info["predictor_pruned_loss"] = predictor_pruned_loss.detach().cpu().item()
+    info["hybrid_simple_loss"] = hybrid_simple_loss.detach().cpu().item()
     info["num_loss"] = num_loss.detach().cpu().item()
     info["den_loss"] = den_loss.detach().cpu().item()
     info["mmi_loss"] = mmi_loss.detach().cpu().item()

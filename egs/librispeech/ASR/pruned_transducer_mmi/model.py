@@ -131,6 +131,7 @@ class Transducer(nn.Module):
             encoder_dim, vocab_size, initial_speed=0.5
         )
         self.simple_predictor_lm_proj = ScaledLinear(decoder_dim, vocab_size)
+        self.simple_hybrid_lm_proj = ScaledLinear(decoder_dim, vocab_size)
         self.external_lm_proj = ScaledLinear(decoder_dim, vocab_size)
 
     def importance_sampling(
@@ -185,12 +186,16 @@ class Transducer(nn.Module):
         assert decoder_dim == self.hybrid_decoder.decoder_dim
 
         # we sample paths from frame 0
+        # (TODO:Wei Kang) Change to sampling different path from different
+        # frame and use smaller path_length.
         t_index = torch.zeros(
             (batch_size, num_paths), dtype=torch.int64, device=device
         )
 
         # The max frame index for each path
-        t_index_max = encoder_out_lens.view(batch_size, 1).expand(batch_size, num_paths)
+        t_index_max = encoder_out_lens.view(batch_size, 1).expand(
+            batch_size, num_paths
+        )
 
         # The left_symbols for each path
         left_symbols = torch.tensor(
@@ -256,11 +261,16 @@ class Transducer(nn.Module):
 
             final_mask = t_index >= t_index_max
             reach_final = torch.any(final_mask)
+            # if reaching final frame, start from randomly selected frame id.
             if reach_final:
-                new_t_index = torch.randint(1, torch.min(t_index_max) - 1, (1,)).item()
+                min_t_index_max = torch.min(t_index_max) - 1
+                min_t_index_max = 1 if min_t_index_max < 1 else min_t_index_max
+                new_t_index = torch.randint(0, min_t_index_max, (1,)).item()
                 t_index.masked_fill_(final_mask, new_t_index)
 
-            left_symbols = left_symbols.view(batch_size, num_paths, context_size)
+            left_symbols = left_symbols.view(
+                batch_size, num_paths, context_size
+            )
             left_symbols_list.append(left_symbols)
             current_symbols = torch.cat(
                 [
@@ -269,10 +279,15 @@ class Transducer(nn.Module):
                 ],
                 dim=2,
             )
+            # if the sampled symbol is blank, we only need to roll the history
+            # symbols, if the sampled symbol is not blank, append the newly
+            # sampled symbol.
             left_symbols = _roll_by_shifts(
                 current_symbols, t_mask.to(torch.int64)
             )
             left_symbols = left_symbols[:, :, 1:]
+            # when reaching final frames, we need to reset the left_symbols to
+            # null.
             if reach_final:
                 left_symbols.masked_fill_(final_mask.unsqueeze(2), blank_id)
 
@@ -285,7 +300,9 @@ class Transducer(nn.Module):
             sampling_probs = torch.gather(
                 probs, dim=2, index=index.unsqueeze(2)
             )
-            sampling_probs = torch.clamp(sampling_probs, min=1e-5, max=1-(1e-5))
+            sampling_probs = torch.clamp(
+                sampling_probs, min=1e-10, max=1 - (1e-10)
+            )
 
             sampling_probs_list.append(sampling_probs.squeeze(2))
 
@@ -418,6 +435,7 @@ class Transducer(nn.Module):
         boundary[:, 2] = y_lens
         boundary[:, 3] = x_lens
 
+        # pruned rnnt loss for predictor head
         predictor_lm = self.simple_predictor_lm_proj(predictor_decoder_out)
         am = self.simple_am_proj(encoder_out)
 
@@ -468,23 +486,59 @@ class Transducer(nn.Module):
                 reduction="sum",
             )
 
-        # currently, use unpruned-rnnt to train hybrid head
+        # pruned rnnt loss for hybrid head
+        hybrid_lm = self.simple_hybrid_lm_proj(hybrid_decoder_out)
+        with torch.cuda.amp.autocast(enabled=False):
+            hybrid_simple_loss, (px_grad, py_grad) = k2.rnnt_loss_simple(
+                lm=hybrid_lm.float(),
+                am=am.float(),
+                symbols=y_padded,
+                termination_symbol=blank_id,
+                external_lm=None,  # external_lm_out_proj,
+                boundary=boundary,
+                modified=True,
+                reduction="sum",
+                return_grad=True,
+            )
+
+        # ranges : [B, T, prune_range]
+        ranges = k2.get_rnnt_prune_ranges(
+            px_grad=px_grad,
+            py_grad=py_grad,
+            boundary=boundary,
+            s_range=prune_range,
+        )
+
+        # am_pruned : [B, T, prune_range, encoder_dim]
+        # lm_pruned : [B, T, prune_range, decoder_dim]
+        am_pruned, lm_pruned = k2.do_rnnt_pruning(
+            am=self.hybrid_joiner.encoder_proj(encoder_out),
+            lm=self.hybrid_joiner.decoder_proj(hybrid_decoder_out),
+            ranges=ranges,
+        )
+
+        # predictor_logits : [B, T, prune_range, vocab_size]
+
+        # project_input=False since we applied the decoder's input projections
+        # prior to do_rnnt_pruning (this is an optimization for speed).
         hybrid_logits = self.hybrid_joiner(
-            encoder_out.unsqueeze(2), hybrid_decoder_out.unsqueeze(1)
+            am_pruned, lm_pruned, project_input=False
         )
 
         with torch.cuda.amp.autocast(enabled=False):
-            num_loss = k2.rnnt_loss(
-                logits=hybrid_logits,
-                external_lm=external_lm_out_proj,
+            hybrid_pruned_loss = k2.rnnt_loss_pruned(
+                logits=hybrid_logits.float(),
                 symbols=y_padded,
+                ranges=ranges,
                 termination_symbol=blank_id,
                 boundary=boundary,
-                modified=True,
+                external_lm=external_lm_out_proj,
                 normalized=normalized,
+                modified=True,
                 reduction="sum",
             )
 
+        # Sampling denominator lattice
         (
             sampled_paths,
             frame_ids,
@@ -517,7 +571,8 @@ class Transducer(nn.Module):
         den_loss = -torch.sum(den_scores)
 
         return (
-            num_loss,
+            hybrid_simple_loss,
+            hybrid_pruned_loss,
             den_loss,
             predictor_simple_loss,
             predictor_pruned_loss,
