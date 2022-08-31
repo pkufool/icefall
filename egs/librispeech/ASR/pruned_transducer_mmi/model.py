@@ -294,7 +294,9 @@ class Transducer(nn.Module):
 
             # (B, num_paths, 1)
             if normalized:
-                hybrid_joiner_output = torch.nn.functional.log_softmax(hybrid_joiner_output, dim=2)
+                hybrid_joiner_output = torch.nn.functional.log_softmax(
+                    hybrid_joiner_output, dim=2
+                )
             hybrid_scores = torch.gather(
                 hybrid_joiner_output, dim=2, index=index.unsqueeze(2)
             )
@@ -530,15 +532,25 @@ class Transducer(nn.Module):
             )
 
             # Only the final arc could be -1 in the arc_map
-            den_lattice.predictor_logprobs = -torch.log(k2.index_select(sampling_probs.flatten(), arc_map, default_value=1.0))
+            den_lattice.predictor_logprobs = -torch.log(
+                k2.index_select(
+                    sampling_probs.flatten(), arc_map, default_value=1.0
+                )
+            )
             # predictor_logprobs will propagate properly
             den_lattice = k2.connect(k2.top_sort(den_lattice))
 
-            posterior = den_lattice.get_arc_post(log_semiring=True, use_double_scores=True).detach()
+            posterior = den_lattice.get_arc_post(
+                log_semiring=True, use_double_scores=True
+            ).detach()
 
             posterior_lattice = k2.Fsa(den_lattice.arcs)
-            posterior_lattice.scores = (den_lattice.predictor_logprobs * posterior).float()
-            posterior_scores = posterior_lattice.get_tot_scores(log_semiring=True, use_double_scores=True)
+            posterior_lattice.scores = (
+                den_lattice.predictor_logprobs * posterior
+            ).float()
+            posterior_scores = posterior_lattice.get_tot_scores(
+                log_semiring=True, use_double_scores=True
+            )
 
             posterior_loss = -torch.sum(posterior_scores)
 
@@ -552,5 +564,5 @@ class Transducer(nn.Module):
             den_loss,
             predictor_simple_loss,
             predictor_pruned_loss,
-            posterior_loss
+            posterior_loss,
         )

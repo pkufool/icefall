@@ -680,9 +680,7 @@ def compute_loss(
     # overwhelming the simple_loss and causing it to diverge,
     # in case it had not fully learned the alignment yet.
     pruned_loss_scale = (
-        0.0
-        if warmup < 1.0
-        else (0.1 if warmup > 1.0 and warmup < 2.0 else 1.0)
+        0.0 if warmup < 1.0 else (0.1 if warmup > 1.0 and warmup < 2.0 else 1.0)
     )
 
     den_loss_scale = 1.0
