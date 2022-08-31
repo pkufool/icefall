@@ -100,11 +100,6 @@ class Transducer(nn.Module):
             (N, U, decoder_dim).
             Its output shape is (N, T, U, vocab_size). Note that its output
             contains unnormalized probs, i.e., not processed by log-softmax.
-          external_lm:
-            The external language model which is just an embedding layer plus
-            a convolution layer. Its input shape
-            is (N, U) and its output shape is (N, U, decoder_dim).
-            It should contain one attribute: `blank_id`.
           encoder_dim:
             The output dimension of encoder.
           decoder_dim:
@@ -118,21 +113,17 @@ class Transducer(nn.Module):
         assert isinstance(encoder, EncoderInterface), type(encoder)
         assert hasattr(hybrid_decoder, "blank_id")
         assert hasattr(predictor_decoder, "blank_id")
-        assert hasattr(external_lm, "blank_id")
 
         self.encoder = encoder
         self.hybrid_decoder = hybrid_decoder
         self.hybrid_joiner = hybrid_joiner
         self.predictor_decoder = predictor_decoder
         self.predictor_joiner = predictor_joiner
-        self.external_lm = external_lm
 
         self.simple_am_proj = ScaledLinear(
             encoder_dim, vocab_size, initial_speed=0.5
         )
         self.simple_predictor_lm_proj = ScaledLinear(decoder_dim, vocab_size)
-        self.simple_hybrid_lm_proj = ScaledLinear(decoder_dim, vocab_size)
-        self.external_lm_proj = ScaledLinear(decoder_dim, vocab_size)
 
     def importance_sampling(
         self,
@@ -140,6 +131,7 @@ class Transducer(nn.Module):
         encoder_out_lens: torch.Tensor,
         path_length: int,
         num_paths: int,
+        normalized: bool = False,
     ) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
@@ -154,6 +146,8 @@ class Transducer(nn.Module):
             How many symbols we will sample for each path.
           num_paths:
             How many paths we will sample for each sequence.
+          normalized:
+            True to normalize the `path_scores`, otherwise not.
         Returns:
           Five tensors will be returned.
           - sampled_paths:
@@ -185,9 +179,9 @@ class Transducer(nn.Module):
         decoder_dim = self.predictor_decoder.decoder_dim
         assert decoder_dim == self.hybrid_decoder.decoder_dim
 
-        # we sample paths from frame 0
         # (TODO:Wei Kang) Change to sampling different path from different
         # frame and use smaller path_length.
+        # we sample paths from frame 0
         t_index = torch.zeros(
             (batch_size, num_paths), dtype=torch.int64, device=device
         )
@@ -233,15 +227,8 @@ class Transducer(nn.Module):
             ).view(batch_size, num_paths, decoder_dim)
             # (B, num_paths, V)
             hybrid_joiner_output = self.hybrid_joiner(
-                current_encoder_out, predictor_decoder_output
+                current_encoder_out, hybrid_decoder_output
             )
-
-            # (B, num_paths, decoder_dim)
-            external_lm_output = self.external_lm(
-                left_symbols, need_pad=False
-            ).view(batch_size, num_paths, decoder_dim)
-            # (B, num_paths, V)
-            external_lm_output = self.external_lm_proj(external_lm_output)
 
             probs = torch.softmax(predictor_joiner_output, -1)
             # sampler: https://pytorch.org/docs/stable/distributions.html#categorical
@@ -257,6 +244,8 @@ class Transducer(nn.Module):
             # index == 0 means the sampled symbol is blank
             t_mask = index == 0
             # t_index = torch.where(t_mask, t_index + 1, t_index)
+            # we currently use modified like path, i.e. there is only one symbol
+            # could be emitted at each frame
             t_index = t_index + 1
 
             final_mask = t_index >= t_index_max
@@ -300,28 +289,16 @@ class Transducer(nn.Module):
             sampling_probs = torch.gather(
                 probs, dim=2, index=index.unsqueeze(2)
             )
-            sampling_probs = torch.clamp(
-                sampling_probs, min=1e-10, max=1 - (1e-10)
-            )
 
             sampling_probs_list.append(sampling_probs.squeeze(2))
 
             # (B, num_paths, 1)
+            if normalized:
+                hybrid_joiner_output = torch.nn.functional.log_softmax(hybrid_joiner_output, dim=2)
             hybrid_scores = torch.gather(
                 hybrid_joiner_output, dim=2, index=index.unsqueeze(2)
             )
-
-            # (B, num_paths, 1)
-            lm_scores = torch.gather(
-                external_lm_output, dim=2, index=index.unsqueeze(2)
-            )
-
-            # blank arcs do not have lm scores
-            # can we set it to 0.0?
-            lm_scores.masked_fill_(mask=t_mask.unsqueeze(2), value=0.0)
-            # detach lm_scoers, we only train external_lm module with NUM loss
-            path_scores = hybrid_scores + lm_scores.detach()
-            path_scores_list.append(path_scores)
+            path_scores_list.append(hybrid_scores)
 
         # sampled_paths : (batch_size, num_paths, path_lengths)
         sampled_paths = torch.stack(sampled_paths_list, dim=2).int()
@@ -349,7 +326,8 @@ class Transducer(nn.Module):
         prune_range: int = 5,
         path_length: int = 25,
         num_paths_per_frame: int = 10,
-        normalized: int = False,
+        normalized: bool = False,
+        enable_den_loss: bool = False,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
         warmup: float = 1.0,
@@ -373,6 +351,10 @@ class Transducer(nn.Module):
           num_paths_per_frame:
             How many linear paths will be sampled when generating the
             denominator lattice.
+          normalized:
+            Whether to normalize num loss and den loss.
+          enable_den_loss:
+            True to sample denominator lattice and return den loss, otherwise not.
           am_scale:
             The scale to smooth the loss with am (output of encoder network)
             part
@@ -404,6 +386,7 @@ class Transducer(nn.Module):
         max_len = torch.max(x_lens).item()
 
         # TODO(Wei Kang): Remove this line when finishing debuging
+        # To make sure we won't sample an empty denominator lattice.
         path_length = max_len if max_len > path_length else path_length
 
         # Now for the decoder, i.e., the prediction network
@@ -421,8 +404,6 @@ class Transducer(nn.Module):
         # decoder_out: [B, S + 1, decoder_dim]
         predictor_decoder_out = self.predictor_decoder(sos_y_padded)
         hybrid_decoder_out = self.hybrid_decoder(sos_y_padded)
-        external_lm_out = self.external_lm(sos_y_padded)
-        external_lm_out_proj = self.external_lm_proj(external_lm_out)
 
         # Note: y does not start with SOS
         # y_padded : [B, S]
@@ -448,6 +429,7 @@ class Transducer(nn.Module):
                 lm_only_scale=lm_scale,
                 am_only_scale=am_scale,
                 boundary=boundary,
+                modified=True,
                 reduction="sum",
                 return_grad=True,
             )
@@ -483,31 +465,11 @@ class Transducer(nn.Module):
                 ranges=ranges,
                 termination_symbol=blank_id,
                 boundary=boundary,
+                modified=True,
                 reduction="sum",
             )
 
         # pruned rnnt loss for hybrid head
-        hybrid_lm = self.simple_hybrid_lm_proj(hybrid_decoder_out)
-        with torch.cuda.amp.autocast(enabled=False):
-            hybrid_simple_loss, (px_grad, py_grad) = k2.rnnt_loss_simple(
-                lm=hybrid_lm.float(),
-                am=am.float(),
-                symbols=y_padded,
-                termination_symbol=blank_id,
-                external_lm=None,  # external_lm_out_proj,
-                boundary=boundary,
-                modified=True,
-                reduction="sum",
-                return_grad=True,
-            )
-
-        # ranges : [B, T, prune_range]
-        ranges = k2.get_rnnt_prune_ranges(
-            px_grad=px_grad,
-            py_grad=py_grad,
-            boundary=boundary,
-            s_range=prune_range,
-        )
 
         # am_pruned : [B, T, prune_range, encoder_dim]
         # lm_pruned : [B, T, prune_range, decoder_dim]
@@ -532,48 +494,63 @@ class Transducer(nn.Module):
                 ranges=ranges,
                 termination_symbol=blank_id,
                 boundary=boundary,
-                external_lm=external_lm_out_proj,
                 normalized=normalized,
                 modified=True,
                 reduction="sum",
             )
 
-        # Sampling denominator lattice
-        (
-            sampled_paths,
-            frame_ids,
-            sampling_probs,
-            path_scores,
-            left_symbols,
-        ) = self.importance_sampling(
-            encoder_out=encoder_out,
-            encoder_out_lens=x_lens,
-            path_length=path_length,
-            num_paths=num_paths_per_frame,
-        )
+        den_loss = None
+        posterior_loss = None
+        if enable_den_loss:
+            # Sampling denominator lattice
+            (
+                sampled_paths,
+                frame_ids,
+                sampling_probs,
+                path_scores,
+                left_symbols,
+            ) = self.importance_sampling(
+                encoder_out=encoder_out,
+                encoder_out_lens=x_lens,
+                path_length=path_length,
+                num_paths=num_paths_per_frame,
+                normalized=normalized,
+            )
 
-        den_lattice = k2.generate_denominator_lattice(
-            sampled_paths=sampled_paths,
-            frame_ids=frame_ids,
-            left_symbols=left_symbols,
-            sampling_probs=sampling_probs.detach(),
-            boundary=x_lens,
-            path_scores=path_scores,
-            vocab_size=vocab_size,
-            context_size=context_size,
-        )
+            den_lattice, arc_map = k2.generate_denominator_lattice(
+                sampled_paths=sampled_paths,
+                frame_ids=frame_ids,
+                left_symbols=left_symbols,
+                sampling_probs=sampling_probs.detach(),
+                boundary=x_lens,
+                path_scores=path_scores,
+                vocab_size=vocab_size,
+                context_size=context_size,
+                return_arc_map=True,
+            )
 
-        den_lattice = k2.connect(k2.top_sort(den_lattice))
+            # Only the final arc could be -1 in the arc_map
+            den_lattice.predictor_logprobs = -torch.log(k2.index_select(sampling_probs.flatten(), arc_map, default_value=1.0))
+            # predictor_logprobs will propagate properly
+            den_lattice = k2.connect(k2.top_sort(den_lattice))
 
-        den_scores = den_lattice.get_tot_scores(
-            log_semiring=True, use_double_scores=True
-        )
-        den_loss = -torch.sum(den_scores)
+            posterior = den_lattice.get_arc_post(log_semiring=True, use_double_scores=True).detach()
+
+            posterior_lattice = k2.Fsa(den_lattice.arcs)
+            posterior_lattice.scores = (den_lattice.predictor_logprobs * posterior).float()
+            posterior_scores = posterior_lattice.get_tot_scores(log_semiring=True, use_double_scores=True)
+
+            posterior_loss = -torch.sum(posterior_scores)
+
+            den_scores = den_lattice.get_tot_scores(
+                log_semiring=True, use_double_scores=True
+            )
+            den_loss = -torch.sum(den_scores)
 
         return (
-            hybrid_simple_loss,
             hybrid_pruned_loss,
             den_loss,
             predictor_simple_loss,
             predictor_pruned_loss,
+            posterior_loss
         )

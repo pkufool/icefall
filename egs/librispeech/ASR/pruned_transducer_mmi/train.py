@@ -380,6 +380,13 @@ def get_parser():
         """,
     )
 
+    parser.add_argument(
+        "--normalization",
+        type=str2bool,
+        default=False,
+        help="Whether to normalize numerator and denominator losses",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -494,7 +501,6 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
     hybrid_joiner = get_joiner_model(params)
     predictor_decoder = get_decoder_model(params)
     predictor_joiner = get_joiner_model(params)
-    external_lm = get_decoder_model(params)
 
     model = Transducer(
         encoder=encoder,
@@ -502,7 +508,6 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         hybrid_joiner=hybrid_joiner,
         predictor_decoder=predictor_decoder,
         predictor_joiner=predictor_joiner,
-        external_lm=external_lm,
         encoder_dim=params.encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
@@ -670,17 +675,27 @@ def compute_loss(
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
-    normalized = True
-    if warmup >= 6.0:
-        normalized = False
+    # after the main warmup step, we keep pruned_loss_scale small
+    # for the same amount of time (model_warm_step), to avoid
+    # overwhelming the simple_loss and causing it to diverge,
+    # in case it had not fully learned the alignment yet.
+    pruned_loss_scale = (
+        0.0
+        if warmup < 1.0
+        else (0.1 if warmup > 1.0 and warmup < 2.0 else 1.0)
+    )
+
+    den_loss_scale = 1.0
+
+    enable_den_loss = True if den_loss_scale > 0.0 else False
 
     with torch.set_grad_enabled(is_training):
         (
-            hybrid_simple_loss,
             num_loss,
             den_loss,
             predictor_simple_loss,
             predictor_pruned_loss,
+            posterior_loss,
         ) = model(
             x=feature,
             x_lens=feature_lens,
@@ -688,27 +703,18 @@ def compute_loss(
             prune_range=params.prune_range,
             path_length=params.path_length,
             num_paths_per_frame=params.num_paths_per_frame,
-            normalized=normalized,
+            normalized=params.normalization,
+            enable_den_loss=enable_den_loss,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
             warmup=warmup,
         )
-        # after the main warmup step, we keep pruned_loss_scale small
-        # for the same amount of time (model_warm_step), to avoid
-        # overwhelming the simple_loss and causing it to diverge,
-        # in case it had not fully learned the alignment yet.
-        pruned_loss_scale = (
-            0.0
-            if warmup < 1.0
-            else (0.1 if warmup > 1.0 and warmup < 2.0 else 1.0)
-        )
-        den_loss_scale = 0.0 if warmup < 3.0 else 0.1
         mmi_loss = pruned_loss_scale * num_loss - den_loss_scale * den_loss
         loss = (
             params.simple_loss_scale * predictor_simple_loss
             + pruned_loss_scale * predictor_pruned_loss
-            + params.simple_loss_scale * hybrid_simple_loss
             + mmi_loss
+            + (posterior_loss if enable_den_loss else 0.0)
         )
 
     assert loss.requires_grad == is_training
@@ -733,10 +739,11 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["predictor_simple_loss"] = predictor_simple_loss.detach().cpu().item()
     info["predictor_pruned_loss"] = predictor_pruned_loss.detach().cpu().item()
-    info["hybrid_simple_loss"] = hybrid_simple_loss.detach().cpu().item()
     info["num_loss"] = num_loss.detach().cpu().item()
-    info["den_loss"] = den_loss.detach().cpu().item()
     info["mmi_loss"] = mmi_loss.detach().cpu().item()
+    if enable_den_loss:
+        info["den_los"] = den_loss.detach().cpu().item()
+        info["posterior_loss"] = posterior_loss.detach().cpu().item()
 
     return loss, info
 

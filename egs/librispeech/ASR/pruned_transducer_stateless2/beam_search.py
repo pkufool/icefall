@@ -579,9 +579,9 @@ def greedy_search_batch(
 
     device = next(model.parameters()).device
 
-    blank_id = model.decoder.blank_id
+    blank_id = model.predictor_decoder.blank_id
     unk_id = getattr(model, "unk_id", blank_id)
-    context_size = model.decoder.context_size
+    context_size = model.predictor_decoder.context_size
 
     batch_size_list = packed_encoder_out.batch_sizes.tolist()
     N = encoder_out.size(0)
@@ -596,11 +596,11 @@ def greedy_search_batch(
         dtype=torch.int64,
     )  # (N, context_size)
 
-    decoder_out = model.decoder(decoder_input, need_pad=False)
-    decoder_out = model.joiner.decoder_proj(decoder_out)
+    decoder_out = model.predictor_decoder(decoder_input, need_pad=False)
+    decoder_out = model.predictor_joiner.decoder_proj(decoder_out)
     # decoder_out: (N, 1, decoder_out_dim)
 
-    encoder_out = model.joiner.encoder_proj(packed_encoder_out.data)
+    encoder_out = model.predictor_joiner.encoder_proj(packed_encoder_out.data)
 
     offset = 0
     for batch_size in batch_size_list:
@@ -613,7 +613,7 @@ def greedy_search_batch(
 
         decoder_out = decoder_out[:batch_size]
 
-        logits = model.joiner(
+        logits = model.predictor_joiner(
             current_encoder_out, decoder_out.unsqueeze(1), project_input=False
         )
         # logits'shape (batch_size, 1, 1, vocab_size)
@@ -634,8 +634,8 @@ def greedy_search_batch(
                 device=device,
                 dtype=torch.int64,
             )
-            decoder_out = model.decoder(decoder_input, need_pad=False)
-            decoder_out = model.joiner.decoder_proj(decoder_out)
+            decoder_out = model.predictor_decoder(decoder_input, need_pad=False)
+            decoder_out = model.predictor_joiner.decoder_proj(decoder_out)
 
     sorted_ans = [h[context_size:] for h in hyps]
     ans = []
