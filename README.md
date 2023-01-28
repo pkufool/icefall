@@ -2,6 +2,15 @@
 <img src="https://raw.githubusercontent.com/k2-fsa/icefall/master/docs/source/_static/logo.png" width=168>
 </div>
 
+
+<iframe
+	src="https://k2-fsa-automatic-speech-recognition.hf.space"
+	frameborder="0"
+	width="850"
+	height="450"
+></iframe>
+
+
 ## Introduction
 
 icefall contains ASR recipes for various datasets
