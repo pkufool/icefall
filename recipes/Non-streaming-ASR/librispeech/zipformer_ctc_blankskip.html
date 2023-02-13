@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" >
 <head>
-  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.17.1: http://docutils.sourceforge.net/" />
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Zipformer CTC Blank Skip &mdash; icefall 0.1 documentation</title>
@@ -11,10 +11,8 @@
     <script src="../../../_static/js/html5shiv.min.js"></script>
   <![endif]-->
   
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
         <script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js"></script>
-        <script src="../../../_static/jquery.js"></script>
-        <script src="../../../_static/underscore.js"></script>
-        <script src="../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
         <script src="../../../_static/doctools.js"></script>
         <script src="../../../_static/sphinx_highlight.js"></script>
     <script src="../../../_static/js/theme.js"></script>
@@ -29,11 +27,15 @@
     <nav data-toggle="wy-nav-shift" class="wy-nav-side">
       <div class="wy-side-scroll">
         <div class="wy-side-nav-search" >
-            <a href="../../../index.html" class="icon icon-home"> icefall
+
+          
+          
+          <a href="../../../index.html" class="icon icon-home">
+            icefall
           </a>
 <div role="search">
   <form id="rtd-search-form" class="wy-form" action="../../../search.html" method="get">
-    <input type="text" name="q" placeholder="Search docs" />
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
     <input type="hidden" name="check_keywords" value="yes" />
     <input type="hidden" name="area" value="default" />
   </form>
@@ -84,7 +86,7 @@
         <div class="rst-content">
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
-      <li><a href="../../../index.html" class="icon icon-home"></a></li>
+      <li><a href="../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
           <li class="breadcrumb-item"><a href="../../index.html">Recipes</a></li>
           <li class="breadcrumb-item"><a href="../index.html">Non Streaming ASR</a></li>
           <li class="breadcrumb-item"><a href="index.html">LibriSpeech</a></li>
@@ -388,23 +390,23 @@ to run the training part first.</p>
 <div><ul class="simple">
 <li><p>(1) <code class="docutils literal notranslate"><span class="pre">epoch-1.pt</span></code>, <code class="docutils literal notranslate"><span class="pre">epoch-2.pt</span></code>, …, which are saved at the end
 of each epoch. You can pass <code class="docutils literal notranslate"><span class="pre">--epoch</span></code> to
-<code class="docutils literal notranslate"><span class="pre">pruned_transducer_stateless7_ctc_bs/ctc_guild_decode_bs.py</span></code> to use them.</p></li>
+<code class="docutils literal notranslate"><span class="pre">pruned_transducer_stateless7_ctc_bs/ctc_guide_decode_bs.py</span></code> to use them.</p></li>
 <li><p>(2) <code class="docutils literal notranslate"><span class="pre">checkpoints-436000.pt</span></code>, <code class="docutils literal notranslate"><span class="pre">epoch-438000.pt</span></code>, …, which are saved
 every <code class="docutils literal notranslate"><span class="pre">--save-every-n</span></code> batches. You can pass <code class="docutils literal notranslate"><span class="pre">--iter</span></code> to
-<code class="docutils literal notranslate"><span class="pre">pruned_transducer_stateless7_ctc_bs/ctc_guild_decode_bs.py</span></code> to use them.</p></li>
+<code class="docutils literal notranslate"><span class="pre">pruned_transducer_stateless7_ctc_bs/ctc_guide_decode_bs.py</span></code> to use them.</p></li>
 </ul>
 <p>We suggest that you try both types of checkpoints and choose the one
 that produces the lowest WERs.</p>
 </div></blockquote>
 </div>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>egs/librispeech/ASR
-$<span class="w"> </span>./pruned_transducer_stateless7_ctc_bs/ctc_guild_decode_bs.py<span class="w"> </span>--help
+$<span class="w"> </span>./pruned_transducer_stateless7_ctc_bs/ctc_guide_decode_bs.py<span class="w"> </span>--help
 </pre></div>
 </div>
 <p>shows the options for decoding.</p>
 <p>The following shows the example using <code class="docutils literal notranslate"><span class="pre">epoch-*.pt</span></code>:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="k">for</span><span class="w"> </span>m<span class="w"> </span><span class="k">in</span><span class="w"> </span>greedy_search<span class="w"> </span>fast_beam_search<span class="w"> </span>modified_beam_search<span class="p">;</span><span class="w"> </span><span class="k">do</span>
-<span class="w">    </span>./pruned_transducer_stateless7_ctc_bs/ctc_guild_decode_bs.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>./pruned_transducer_stateless7_ctc_bs/ctc_guide_decode_bs.py<span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--epoch<span class="w"> </span><span class="m">30</span><span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--avg<span class="w"> </span><span class="m">13</span><span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--exp-dir<span class="w"> </span>pruned_transducer_stateless7_ctc_bs/exp<span class="w"> </span><span class="se">\</span>
@@ -415,7 +417,7 @@ $<span class="w"> </span>./pruned_transducer_stateless7_ctc_bs/ctc_guild_decode_
 </div>
 <p>To test CTC branch, you can use the following command:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="k">for</span><span class="w"> </span>m<span class="w"> </span><span class="k">in</span><span class="w"> </span>ctc-decoding<span class="w"> </span>1best<span class="p">;</span><span class="w"> </span><span class="k">do</span>
-<span class="w">    </span>./pruned_transducer_stateless7_ctc_bs/ctc_guild_decode_bs.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>./pruned_transducer_stateless7_ctc_bs/ctc_guide_decode_bs.py<span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--epoch<span class="w"> </span><span class="m">30</span><span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--avg<span class="w"> </span><span class="m">13</span><span class="w"> </span><span class="se">\</span>
 <span class="w">        </span>--exp-dir<span class="w"> </span>pruned_transducer_stateless7_ctc_bs/exp<span class="w"> </span><span class="se">\</span>
@@ -445,14 +447,14 @@ command to extract <code class="docutils literal notranslate"><span class="pre">
 <p>It will generate a file <code class="docutils literal notranslate"><span class="pre">./pruned_transducer_stateless7_ctc_bs/exp/pretrained.pt</span></code>.</p>
 <div class="admonition hint">
 <p class="admonition-title">Hint</p>
-<p>To use the generated <code class="docutils literal notranslate"><span class="pre">pretrained.pt</span></code> for <code class="docutils literal notranslate"><span class="pre">pruned_transducer_stateless7_ctc_bs/ctc_guild_decode_bs.py</span></code>,
+<p>To use the generated <code class="docutils literal notranslate"><span class="pre">pretrained.pt</span></code> for <code class="docutils literal notranslate"><span class="pre">pruned_transducer_stateless7_ctc_bs/ctc_guide_decode_bs.py</span></code>,
 you can run:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>pruned_transducer_stateless7_ctc_bs/exp
 ln<span class="w"> </span>-s<span class="w"> </span>pretrained<span class="w"> </span>epoch-9999.pt
 </pre></div>
 </div>
 <p>And then pass <code class="docutils literal notranslate"><span class="pre">--epoch</span> <span class="pre">9999</span> <span class="pre">--avg</span> <span class="pre">1</span> <span class="pre">--use-averaged-model</span> <span class="pre">0</span></code> to
-<code class="docutils literal notranslate"><span class="pre">./pruned_transducer_stateless7_ctc_bs/ctc_guild_decode_bs.py</span></code>.</p>
+<code class="docutils literal notranslate"><span class="pre">./pruned_transducer_stateless7_ctc_bs/ctc_guide_decode_bs.py</span></code>.</p>
 </div>
 <p>To use the exported model with <code class="docutils literal notranslate"><span class="pre">./pruned_transducer_stateless7_ctc_bs/pretrained.py</span></code>, you
 can run:</p>
@@ -514,7 +516,8 @@ are on CPU. You can use <code class="docutils literal notranslate"><span class="
 by visiting the following links:</p>
 <blockquote>
 <div><ul class="simple">
-<li><p><a class="reference external" href="https://huggingface.co/yfyeung/icefall-asr-librispeech-pruned_transducer_stateless7_ctc_bs-2022-12-14">https://huggingface.co/yfyeung/icefall-asr-librispeech-pruned_transducer_stateless7_ctc_bs-2022-12-14</a></p></li>
+<li><p>trained on LibriSpeech 100h: <a class="reference external" href="https://huggingface.co/yfyeung/icefall-asr-librispeech-pruned_transducer_stateless7_ctc_bs-2022-12-14">https://huggingface.co/yfyeung/icefall-asr-librispeech-pruned_transducer_stateless7_ctc_bs-2022-12-14</a></p></li>
+<li><p>trained on LibriSpeech 960h: <a class="reference external" href="https://huggingface.co/yfyeung/icefall-asr-librispeech-pruned_transducer_stateless7_ctc_bs-2023-01-29">https://huggingface.co/yfyeung/icefall-asr-librispeech-pruned_transducer_stateless7_ctc_bs-2023-01-29</a></p></li>
 </ul>
 <p>See <a class="reference external" href="https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/RESULTS.md">https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/RESULTS.md</a>
 for the details of the above pretrained models</p>
