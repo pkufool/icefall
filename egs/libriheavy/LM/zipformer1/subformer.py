@@ -996,7 +996,8 @@ class LearnedDownsamplingModule(nn.Module):
         return attn_offset
 
 
-    def upsample(self, x_orig: Tensor, x: Tensor, indexes: Tensor) -> Tensor:
+    def upsample(self, x_orig: Tensor, x: Tensor, indexes: Tensor,
+                 weights: Optional[Tensor] = None) -> Tensor:
         """
         Upsamples, reversing the downsample() operation and filling in
         any not-chosen frames with their original value before downsampling
@@ -1006,30 +1007,40 @@ class LearnedDownsamplingModule(nn.Module):
             x_orig: (seq_len, batch_size, num_channels)
             x: (seq_len_reduced, batch_size, num_channels)
           indexes: (batch_size, seq_len_reduced), contains original frame indexes
+          weights: optional tensor
 
         Downsamples x via indexing with the indexes obtained from the
         forward() function.
 
         Args:
-           x: tensor of shape (seq_len, batch_size, indexes)
+            x: tensor of shape (seq_len, batch_size, indexes)
+         weights: a tensor of shape (batch_size, seq_len_reduced) containing weights between
+             0 and 1, where 1 means fully use this x value and 0 means use x_orig
          indexes: integer indexes of shape (batch_size, seq_len_reduced), with elements
                  0 <= indexes < seq_len.
         """
         (seq_len, batch_size, num_channels) = x_orig.shape
 
-        not_kept = torch.ones(batch_size, seq_len, dtype=torch.bool,
-                              device=x.device)
-        not_kept.scatter_(dim=1, index=indexes, value=False)
+        x_weight = 1.0 if weights is None else weights.t().unsqueeze(-1)
+        # x_weight: (seq_len_reduced, batch_size, 1) if a tensor
+
+        orig_x_weight = torch.ones(batch_size, seq_len,
+                                   device=x.device, dtype=x.dtype)
+        if weights is None:
+            orig_x_weight.scatter_(dim=1, index=indexes, value=0.)
+        else:
+            orig_x_weight.scatter_(dim=1, index=indexes,
+                                   src=(1. - weights).to(x.dtype))
 
         indexes = indexes.t().unsqueeze(-1).expand(-1, batch_size, num_channels)
         # indexes now: (seq_len_reduced, batch_size, num_channels)
 
         ans = torch.zeros_like(x_orig)
 
-        ans.scatter_(dim=0, index=indexes, src=x)
+        ans.scatter_(dim=0, index=indexes, src=(x * x_weight))
 
         # add in x_orig in the frames that were not originally kept.
-        return ans + x_orig * not_kept.t().unsqueeze(-1)
+        return ans + x_orig * orig_x_weight.t().unsqueeze(-1)
 
 
 class DownsampledSubformerEncoder(nn.Module):
@@ -1119,7 +1130,8 @@ class DownsampledSubformerEncoder(nn.Module):
         src_orig = convert_num_channels(src_orig, src.shape[-1])
 
         if hasattr(self, 'downsampler'):
-            src = self.downsampler.upsample(src_orig, src, indexes)
+            src = self.downsampler.upsample(src_orig, src,
+                                            indexes, weights)
 
         return self.out_combiner(src_orig, src)
 
