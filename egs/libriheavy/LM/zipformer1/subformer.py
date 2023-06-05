@@ -813,7 +813,7 @@ class LearnedDownsamplingModule(nn.Module):
         super().__init__()
 
         self.to_scores = nn.Linear(embed_dim, 1, bias=False)
-        self.to_scores.lr_factor = 0.5
+        self.to_scores.lr_scale = 0.5
         # score_balancer is just to keep the magnitudes of the scores in
         # a fixed range and keep them balanced around zero, to stop
         # these drifting around.
@@ -866,7 +866,7 @@ class LearnedDownsamplingModule(nn.Module):
 
 
             weights_discarded = weights[:, seq_len_reduced:2*seq_len_reduced]
-            missing = weights_discarded.shape[1] - seq_len_reduced
+            missing = seq_len_reduced - weights_discarded.shape[1]
             if missing != 0:
                 weights_discarded = torch.cat((weights_discarded,
                                                torch.zeros(batch_size, missing,
