@@ -45,6 +45,7 @@
               <p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../installation/index.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../docker/index.html">Docker</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../faqs.html">Frequently Asked Questions (FAQs)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../model-export/index.html">Model export</a></li>
 </ul>
@@ -127,7 +128,7 @@ $<span class="w"> </span>./pruned_transducer_stateless7_streaming/decode.py<span
 <span class="w">    </span>--avg<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--use-averaged-model<span class="w"> </span>False<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--exp-dir<span class="w"> </span><span class="nv">$exp_dir</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--bpe-model<span class="w"> </span>./icefall-asr-librispeech-pruned-transducer-stateless7-streaming-2022-12-29/data/lang_bpe_500/bpe.model
+<span class="w">    </span>--bpe-model<span class="w"> </span>./icefall-asr-librispeech-pruned-transducer-stateless7-streaming-2022-12-29/data/lang_bpe_500/bpe.model<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max-duration<span class="w"> </span><span class="m">600</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--decode-chunk-len<span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--decoding-method<span class="w"> </span>modified_beam_search
@@ -170,7 +171,7 @@ $<span class="w"> </span>./pruned_transducer_stateless7_streaming/decode.py<span
 <span class="w">    </span>--max-duration<span class="w"> </span><span class="m">600</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--decode-chunk-len<span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--decoding-method<span class="w"> </span>modified_beam_search_lm_shallow_fusion<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--bpe-model<span class="w"> </span>./icefall-asr-librispeech-pruned-transducer-stateless7-streaming-2022-12-29/data/lang_bpe_500/bpe.model
+<span class="w">    </span>--bpe-model<span class="w"> </span>./icefall-asr-librispeech-pruned-transducer-stateless7-streaming-2022-12-29/data/lang_bpe_500/bpe.model<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--use-shallow-fusion<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--lm-type<span class="w"> </span>rnn<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--lm-exp-dir<span class="w"> </span><span class="nv">$lm_dir</span><span class="w"> </span><span class="se">\</span>
@@ -227,7 +228,7 @@ the LM score may dominant during decoding, leading to bad WER. A typical value o
 </ul>
 <p>Here, we also show how <cite>–beam-size</cite> effect the WER and decoding time:</p>
 <table class="docutils align-default" id="id2">
-<caption><span class="caption-number">Table 1 </span><span class="caption-text">WERs and decoding time (on test-clean) of shallow fusion with different beam sizes</span><a class="headerlink" href="#id2" title="Permalink to this table"></a></caption>
+<caption><span class="caption-number">Table 2 </span><span class="caption-text">WERs and decoding time (on test-clean) of shallow fusion with different beam sizes</span><a class="headerlink" href="#id2" title="Permalink to this table"></a></caption>
 <colgroup>
 <col style="width: 25%" />
 <col style="width: 25%" />
