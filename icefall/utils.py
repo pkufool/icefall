@@ -1184,7 +1184,7 @@ class MetricsTracker(collections.defaultdict):
                     ans_utterances += ", "
                 else:
                     raise ValueError(f"Unexpected key: {k}")
-        frames = "%.2f" % self["frames"]
+        frames = "%.2f" % self["frames"] if "frames" in self else 0
         ans_frames += "over " + str(frames) + " frames. "
         if ans_utterances != "":
             utterances = "%.2f" % self["utterances"]

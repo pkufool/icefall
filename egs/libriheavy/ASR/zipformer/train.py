@@ -1187,8 +1187,10 @@ def run(rank, world_size, args):
         register_inf_check_hooks(model)
 
     def normalize_text(c: Cut):
-        text = remove_punc_to_upper(c.supervisions[0].text)
-        c.supervisions[0].text = text
+        if not params.train_with_punctuation:
+            text = remove_punc_to_upper(c.supervisions[0].text)
+            c.supervisions[0].text = text
+        c.start += 0.001
         return c
 
     def remove_short_and_long_utt(c: Cut):
@@ -1201,29 +1203,6 @@ def run(rank, world_size, args):
         # an utterance duration distribution for your dataset to select
         # the threshold
         if c.duration < 2.0 or c.duration > 30.0:
-            # logging.warning(
-            #     f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
-            # )
-            return False
-
-        # In pruned RNN-T, we require that T >= S
-        # where T is the number of feature frames after subsampling
-        # and S is the number of tokens in the utterance
-
-        # In ./zipformer.py, the conv module uses the following expression
-        # for subsampling
-        T = ((c.num_frames - 7) // 2 + 1) // 2
-        tokens = sp.encode(c.supervisions[0].text, out_type=str)
-
-        if T < len(tokens):
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. "
-                f"Number of frames (before subsampling): {c.num_frames}. "
-                f"Number of frames (after subsampling): {T}. "
-                f"Text: {c.supervisions[0].text}. "
-                f"Tokens: {tokens}. "
-                f"Number of tokens: {len(tokens)}"
-            )
             return False
 
         return True
@@ -1236,8 +1215,7 @@ def run(rank, world_size, args):
     if params.subset == "L":
         train_cuts += libriheavy.train_large_cuts()
 
-    if not params.train_with_punctuation:
-        train_cuts = train_cuts.map(normalize_text)
+    train_cuts = train_cuts.map(normalize_text)
 
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
 

@@ -85,7 +85,9 @@ if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
   #   - piper_phonemize: pip install piper_phonemize -f https://k2-fsa.github.io/icefall/piper_phonemize.html,
   #   - espnet_tts_frontend, `pip install espnet_tts_frontend`, refer to https://github.com/espnet/espnet_tts_frontend/
   if [ ! -e data/spectrogram/.ljspeech_with_token.done ]; then
-    ./local/prepare_tokens_ljspeech.py
+    ./local/prepare_tokens_ljspeech.py \
+      --minfests-in data/spectrogram/ljspeech_cuts_all.jsonl.gz \
+      --miniests-out data/spectrogram/ljspeech_cuts_with_tokens_all.jsonl.gz
     mv data/spectrogram/ljspeech_cuts_with_tokens_all.jsonl.gz \
       data/spectrogram/ljspeech_cuts_all.jsonl.gz
     touch data/spectrogram/.ljspeech_with_token.done
@@ -93,7 +95,20 @@ if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
 fi
 
 if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
-  log "Stage 4: Split the LJSpeech cuts into train, valid and test sets"
+  log "Stage 4: Prepare tokens durations for LJSpeech"
+  if [ ! -e data/spectrogram/.ljspeech_with_duration.done ]; then
+    ./local/compute_alignment.py \
+      --manifests-in data/spectrogram/ljspeech_cuts_all.jsonl.gz \
+      --manifests-out data/spectrogram/ljspeech_cuts_with_durations_all.jsonl.gz
+
+    mv data/spectrogram/ljspeech_cuts_with_durations_all.jsonl.gz \
+      data/spectrogram/ljspeech_cuts_all.jsonl.gz
+    touch data/spectrogram/.ljspeech_with_duration.done
+  fi
+fi
+
+if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
+  log "Stage 5: Split the LJSpeech cuts into train, valid and test sets"
   if [ ! -e data/spectrogram/.ljspeech_split.done ]; then
     lhotse subset --last 600 \
       data/spectrogram/ljspeech_cuts_all.jsonl.gz \
@@ -115,8 +130,31 @@ if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
   fi
 fi
 
-if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
-  log "Stage 5: Generate token file"
+if [ $stage -le 6 ] && [ $stop_stage -ge 6 ]; then
+  log "Stage 6: Split the LJSpeech cuts into train, valid and test sets"
+  if [ ! -e data/fbank/.ljspeech_split.done ]; then
+    lhotse subset --last 600 \
+      data/fbank/ljspeech_cuts_all.jsonl.gz \
+      data/fbank/ljspeech_cuts_validtest.jsonl.gz
+    lhotse subset --first 100 \
+      data/fbank/ljspeech_cuts_validtest.jsonl.gz \
+      data/fbank/ljspeech_cuts_valid.jsonl.gz
+    lhotse subset --last 500 \
+      data/fbank/ljspeech_cuts_validtest.jsonl.gz \
+      data/fbank/ljspeech_cuts_test.jsonl.gz
+
+    rm data/fbank/ljspeech_cuts_validtest.jsonl.gz
+
+    n=$(( $(gunzip -c data/fbank/ljspeech_cuts_all.jsonl.gz | wc -l) - 600 ))
+    lhotse subset --first $n  \
+      data/fbank/ljspeech_cuts_all.jsonl.gz \
+      data/fbank/ljspeech_cuts_train.jsonl.gz
+      touch data/fbank/.ljspeech_split.done
+  fi
+fi
+
+if [ $stage -le 7 ] && [ $stop_stage -ge 7 ]; then
+  log "Stage 7: Generate token file"
   # We assume you have installed piper_phonemize and espnet_tts_frontend.
   # If not, please install them with:
   #   - piper_phonemize: refer to https://github.com/rhasspy/piper-phonemize,
@@ -126,3 +164,4 @@ if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
     ./local/prepare_token_file.py --tokens data/tokens.txt
   fi
 fi
+
