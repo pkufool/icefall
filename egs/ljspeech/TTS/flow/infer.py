@@ -238,10 +238,7 @@ def decode_one_batch(
 
     audios = vocoder.forward(features.permute(0, 2, 1))
 
-    logging.info(f"audios shape : {audios.shape}")
     # torch.set_printoptions(profile="full")
-
-    logging.info(f"audios : {audios[0]}")
 
     for i in range(audios.shape[0]):
         audio = audios[i]

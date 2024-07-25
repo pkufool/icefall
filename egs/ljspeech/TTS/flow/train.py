@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Copyright         2023  Xiaomi Corp.        (authors: Zengwei Yao)
+# Copyright         2023  Xiaomi Corp.        (authors: Zengwei Yao,
+#                                                       Wei Kang)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -25,10 +26,6 @@ import json
 import copy
 import math
 import os
-
-from lhotse import Fbank, FbankConfig
-import librosa
-import optim
 
 import sentencepiece as spm
 import k2
@@ -540,17 +537,6 @@ def pad_durations(durations: List[List[int]], num_frames: int) -> List[List[int]
     return [x + [num_frames - sum(x)] for x in durations]
 
 
-def get_default_durations(y_lens: List[int], num_frames: int) -> List[List[int]]:
-    """
-    Returns default durations of symbols in utterances.
-    """
-    # Note: we may later want to pad the symbols with 0 or EOS or something,
-    # as get_frame_pos would otherwise return a value one past the end.
-    return pad_durations(
-        [[num_frames // length] * length for length in y_lens], num_frames
-    )
-
-
 def get_transcript_pos(durations: List[List[int]], num_frames: int) -> Tensor:
     """
     Gets position in the transcript for each frame, i.e. the position
@@ -568,150 +554,6 @@ def get_transcript_pos(durations: List[List[int]], num_frames: int) -> Tensor:
             cur_frame += d
         assert cur_frame == num_frames, (cur_frame, num_frames)
     return ans
-
-
-def get_src_positions(
-    durations: List[List[int]], default_durations: List[List[int]], num_frames: int
-) -> Tensor:
-    """
-    Returns a Tensor of floats showing, for each frame in the batch, what the frame-index
-    would be if the durations all had their default values.     Some of the frame-indexes
-    will not be exact integers.
-
-    Returns: a Tensor of shape (batch_size, num_frames) containing values 0 <= t <= num_frame.
-    """
-    batch_size = len(durations)
-    ans = Tensor(batch_size, num_frames)
-    for b in range(batch_size):
-        this_dur = durations[b]
-        this_default_dur = default_durations[b]
-        assert len(this_dur) == len(this_default_dur)
-        length = len(this_dur)
-        cur_frame = 0  # frame with actual durations
-        cur_src_frame = 0  # frame with default durations
-        for d, dd in zip(this_dur, this_default_dur):
-            for i in range(d):  # for each frame of the actual duration..
-                ans[b, cur_frame] = cur_src_frame + i * (dd / d)
-                cur_frame += 1
-            cur_src_frame += dd
-        assert cur_frame == num_frames and cur_src_frame == num_frames
-    return ans
-
-
-def get_initial_state(
-    y: Tensor,
-    transcript_pos: Tensor,
-    embed: nn.Embedding,  # embedding of BPE pieces
-    noise: Tensor,
-    noise_scale: float = 1.0,
-):  #  we can tune noise_scale for performance.  must match in train vs. test.
-    """
-      Returns the initial state of the flow, i.e. x(0), which is the phones all being equally-spaced
-      and filling up the duration of the utterance.  The duration will presumably reflect the
-      max duration of any utterance in the batch, which we can estimate using some crude method.
-
-      Args:
-         y: a Tensor of shape (batch_size, max_len) containing symbol sequences (BPE pieces), one for each
-            utterance in the batch.  the symbol sequences may be BPE pieces.  Things like EOS don't
-            matter much here, as long as it's consistent.
-      transcript_pos: of shape (batch_size, num_frames), it is  as returned by get_transcript_pos
-            given the default durations.  It contains the position in the transcript for each frame
-             of the output.  Will be used to look up embeddings of bpe pieces.
-        embed: an embedding module to turn the y values into embedding vectors.
-        noise: a Tensor of Gaussian noise of shape (batch_size, num_frames, feat_dim)
-    noise_scale: a scale on the noise, may be tuned to match the scale of the embeddings as these may
-        be different in different models which might affect performance.
-
-      Returns:
-         x0:  a Tensor of shape (batch_size, num_frames, feat_dim)
-    """
-    (batch_size, num_frames, feat_dim) = noise.shape
-    max_len = y.shape[-1]  # will probably include an EOS position.
-    assert y.shape == (batch_size, max_len)
-    transcript_embed = embed(y)
-    assert transcript_embed.shape == (batch_size, max_len, feat_dim)
-    assert transcript_pos.shape == (batch_size, num_frames)
-
-    ans = torch.gather(
-        transcript_embed,
-        dim=1,
-        index=transcript_pos.unsqueeze(-1).expand(batch_size, num_frames, feat_dim),
-    )
-    return ans + noise * noise_scale
-
-
-def lookup(x: Tensor, positions: Tensor) -> Tensor:
-    """
-      Index x by frame indexes that may be non-integer, in which case we interpolate.
-      In effect this does bilinear warping.
-
-      Args:
-            x: of shape (batch_size, num_frames, feat_dim), the input to be warped.
-    positions: of shape (batch_size, num_frames), positions 0 <= t <= num_frames to
-               look up or interpolate within x.
-    """
-    (batch_size, num_frames, feat_dim) = x.shape
-    positions = positions.clamp(min=0, max=num_frames - 1.0e-05)
-
-    positions_floor = torch.floor(positions)
-    positions_rem = positions - positions_floor
-    positions_floor = positions_floor.to(
-        torch.int64
-    )  # depending on torch version, could use int32.
-    positions_ceil = positions_floor + 1
-
-    positions_floor = positions_floor.clamp(max=num_frames - 1)
-    positions_ceil = positions_ceil.clamp(max=num_frames - 1)
-
-    # torch.set_printoptions(profile="full")
-
-    def gather(x, p):
-        return torch.gather(
-            x, dim=1, index=p.unsqueeze(-1).expand(batch_size, num_frames, feat_dim)
-        )
-
-    return gather(x, positions_floor) * (1.0 - positions_rem).unsqueeze(-1) + gather(
-        x, positions_ceil
-    ) * positions_rem.unsqueeze(-1)
-
-
-def interpolate(
-    t: Tensor, x0: Tensor, x1: Tensor, src_positions: Tensor, dest_positions: Tensor
-) -> Tensor:
-    """
-      Interpolate between x0 and x1 in a way that includes time-warping.
-      Args:
-          t: a Tensor of shape (batch_size, 1, 1); if t==0 this will return x0,
-             if t==1 this will return x1.
-         x0: (batch_size, num_frames, feat_dim), the value to return on t==0
-         x1: (batch_size, num_frames, feat_dim), the value to return on t==1
-    src_positions: of shape (batch_size, num_frames), for each frame-index in x1 this
-             gives the corresponding frame in x0, these frame values are not necessarily
-             integers but are in the range 0..num_frames.
-    dest_positions: of shape (batch_size, num_frames), for each frame-index in x0 this
-             gives the corresponding frame in x1, these frame values are not necessarily
-             integers but are in the range 0..num_frames
-    """
-    assert not x0.dtype in [
-        torch.float16,
-        torch.bfloat16,
-    ]  # taking a small delta would not work
-    (batch_size, num_frames, feat_dim) = x1.shape
-
-    default_positions = (
-        torch.arange(num_frames, device=x1.device)
-        .unsqueeze(0)
-        .expand(batch_size, num_frames)
-    )
-
-    # x0_positions gives the frame indexes in x0.  at t == 0 this is just default_positions i.e. no warping.
-    x0_positions = src_positions * t + default_positions * (1 - t)
-    # x1_positions gives the frame indexes in x1.  at t == 1 this is just default_positions, i.e. no warping.
-    x1_positions = dest_positions * (1 - t) + default_positions * t
-
-    return (1 - t).unsqueeze(-1) * lookup(x0, x0_positions) + t.unsqueeze(-1) * lookup(
-        x1, x1_positions
-    )
 
 
 def to_tensor(y: List[List[int]]):
@@ -733,18 +575,12 @@ def get_conditions(
     y: List[List[int]],
     durations: List[List[int]],
     x1: Tensor,
-    print_tensor: bool = False,
 ) -> Tensor:
     """
-     Returns (xt, ut), where xt is the neural network input value x(t) evaluted
-        at the provided random times, and ut is the target for the loss,
-        representing the flow direction.
-     Args:
+    Args:
         embed: the embedding module, gives embeddings of dimension feat_dim, can be random.
             y: the transcripts (without EOS), indexed [batch][position]
     durations: the duration of each symbol in y.  Same shape as y.
-            t: the (random) time values between 0 and 1.
-        noise: gaussian random noise of shape (batch_size, num_frames, feat_dim)
            x1: the target speech, of shape (batch_size, num_frames, feat_dim)
     """
     (batch_size, num_frames, feat_dim) = x1.shape
@@ -755,14 +591,6 @@ def get_conditions(
 
     y_padded = [l + [0] for l in y]
     y_padded = to_tensor(y_padded).to(x1.device)  # (B, S + 1)
-
-    if print_tensor:
-        torch.set_printoptions(profile="full")
-        logging.info(f"durations : {durations[0]},  {len(durations[0])}")
-        logging.info(f"y : {y[0]}, {len(y[0])}")
-        logging.info(f"y_padded : {y_padded[0]}")
-        logging.info(f"durs : {durs[0]}")
-        logging.info(f"transcript_pos : {transcript_pos[0]}")
 
     max_len = y_padded.shape[-1]  # will probably include an EOS position.
     assert y_padded.shape == (batch_size, max_len)
@@ -787,16 +615,9 @@ def get_duration_conditions(
     device,
 ) -> Tensor:
     """
-     Returns (xt, ut), where xt is the neural network input value x(t) evaluted
-        at the provided random times, and ut is the target for the loss,
-        representing the flow direction.
-     Args:
-        embed: the embedding module, gives embeddings of dimension feat_dim, can be random.
-            y: the transcripts (without EOS), indexed [batch][position]
-    durations: the duration of each symbol in y.  Same shape as y.
-            t: the (random) time values between 0 and 1.
-        noise: gaussian random noise of shape (batch_size, num_frames, feat_dim)
-           x1: the target speech, of shape (batch_size, num_frames, feat_dim)
+    Args:
+       embed: the embedding module, gives embeddings of dimension feat_dim, can be random.
+           y: the transcripts (without EOS), indexed [batch][position]
     """
 
     batch_size = len(y)
@@ -807,85 +628,6 @@ def get_duration_conditions(
     transcript_embed = embed(y_padded)  # (B, S, F)
 
     return transcript_embed
-
-
-def get_xt_and_ut(
-    embed: nn.Embedding,
-    y: List[List[int]],
-    durations: List[List[int]],
-    t: Tensor,
-    noise: Tensor,
-    x1: Tensor,
-) -> Tuple[Tensor, Tensor]:
-    """
-     Returns (xt, ut), where xt is the neural network input value x(t) evaluted
-        at the provided random times, and ut is the target for the loss,
-        representing the flow direction.
-     Args:
-        embed: the embedding module, gives embeddings of dimension feat_dim, can be random.
-            y: the transcripts (without EOS), indexed [batch][position]
-    durations: the duration of each symbol in y.  Same shape as y.
-            t: the (random) time values between 0 and 1.
-        noise: gaussian random noise of shape (batch_size, num_frames, feat_dim)
-           x1: the target speech, of shape (batch_size, num_frames, feat_dim)
-    """
-    (batch_size, num_frames, feat_dim) = x1.shape
-
-    durs = pad_durations(durations, num_frames)
-    default_durs = get_default_durations([len(x) for x in y], num_frames)
-
-    assert len(durs) == len(default_durs), (len(durs), len(default_durs))
-
-    y_padded = [l + [0] for l in y]
-
-    x0 = get_initial_state(
-        to_tensor(y_padded).to(x1.device),
-        get_transcript_pos(default_durs, num_frames).to(x1.device),
-        embed,
-        noise,
-    )
-
-    src_positions = get_src_positions(durs, default_durs, num_frames).to(x1.device)
-    dest_positions = get_src_positions(default_durs, durs, num_frames).to(x1.device)
-
-    # taking a small delta would not work in half precision
-    assert not x0.dtype in [torch.float16, torch.bfloat16]
-    delta = 0.001
-    xt = interpolate(t, x0, x1, src_positions, dest_positions)
-    xt_delta = interpolate(t + delta, x0, x1, src_positions, dest_positions)
-    ut = (
-        xt_delta - xt
-    ) / delta  # derivative w.r.t. t, obtained by finite-difference method.
-
-    return xt, ut
-
-
-def get_x0(
-    params: AttributeDict,
-    y: List[List[int]],
-    embed: nn.Embedding,
-    noise_scale: float = 1.0,
-    duration_per_symbol: float = 0.2,
-):
-    num_frames = (
-        max([len(x) for x in y]) * duration_per_symbol * 1000 / params.frame_shift_ms
-    )
-    num_frames = int(num_frames)
-
-    default_durs = get_default_durations([len(x) for x in y], num_frames)
-
-    y_padded = [l + [0] for l in y]
-
-    noise = torch.randn((len(y), num_frames, params.feat_dim), device=params.device)
-
-    x0 = get_initial_state(
-        y=to_tensor(y_padded).to(params.device),
-        transcript_pos=get_transcript_pos(default_durs, num_frames).to(params.device),
-        embed=embed,
-        noise=noise,
-        noise_scale=noise_scale,
-    )
-    return x0
 
 
 def prepare_input(
@@ -968,12 +710,6 @@ def compute_duration_loss(
                     )  # (B, S, 1)
         except:  # noqa
             raise
-        if rank == 0 and params.batch_idx_train % 100 == 0:
-            logging.info(f"dt mean : {torch.mean(dt)}, stddev : {torch.std(dt)}")
-            logging.info(f"dut mean : {torch.mean(dut)}, stddev : {torch.std(dut)}")
-            logging.info(f"dvt mean : {torch.mean(dvt)}, stddev : {torch.std(dvt)}")
-            logging.info(f"dut : {dut}, dvt : {dvt}")
-
         loss = torch.mean((dvt - dut) ** 2)
 
     assert loss.requires_grad == is_training
@@ -1011,7 +747,6 @@ def compute_fbank_loss(
         y=tokens,
         durations=durations,
         x1=x1,
-        print_tensor=False,  # params.batch_idx_train % 100 == 0,
     )  # (B, T, F)
 
     xt = torch.cat((xt, conditions), dim=2)  # (B, T, 2*F)
@@ -1028,9 +763,6 @@ def compute_fbank_loss(
             xt_ = torch.transpose(xt[0], 0, 1).detach().cpu()
             ut_ = torch.transpose(ut[0], 0, 1).detach().cpu()
             vt_ = torch.transpose(vt[0], 0, 1).detach().cpu()
-            logging.info(f"xt mean : {torch.mean(xt)}, stddev : {torch.std(xt)}")
-            logging.info(f"ut mean : {torch.mean(ut)}, stddev : {torch.std(ut)}")
-            logging.info(f"vt mean : {torch.mean(vt)}, stddev : {torch.std(vt)}")
             tb_writer.add_image(
                 f"xt_ut_vt/xt_",
                 plot_tensor(xt_),
@@ -1299,8 +1031,6 @@ def generate_samples(
         gen_log_durations = traj[-1, :].view([num_symbols, -1]).permute(1, 0)
 
         gen_durations = torch.exp(gen_log_durations).ceil().int().tolist()
-
-        logging.info(f"Generated durations : {gen_durations}")
 
         x0 = torch.randn_like(features)
         x1 = features
@@ -1642,26 +1372,26 @@ def run(rank, world_size, args):
             rank=rank,
         )
 
-        # if epoch % params.save_every_n == 0 or epoch == params.num_epochs:
-        #    filename = params.exp_dir / f"epoch-{params.cur_epoch}.pt"
-        #    save_checkpoint(
-        #        filename=filename,
-        #        params=params,
-        #        model=model,
-        #        optimizer=optimizer,
-        #        scheduler=scheduler,
-        #        sampler=train_dl.sampler,
-        #        scaler=scaler,
-        #        rank=rank,
-        #    )
-        #    if rank == 0:
-        #        if params.best_train_epoch == params.cur_epoch:
-        #            best_train_filename = params.exp_dir / "best-train-loss.pt"
-        #            copyfile(src=filename, dst=best_train_filename)
+        if epoch % params.save_every_n == 0 or epoch == params.num_epochs:
+            filename = params.exp_dir / f"epoch-{params.cur_epoch}.pt"
+            save_checkpoint(
+                filename=filename,
+                params=params,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                sampler=train_dl.sampler,
+                scaler=scaler,
+                rank=rank,
+            )
+            if rank == 0:
+                if params.best_train_epoch == params.cur_epoch:
+                    best_train_filename = params.exp_dir / "best-train-loss.pt"
+                    copyfile(src=filename, dst=best_train_filename)
 
-        #        if params.best_valid_epoch == params.cur_epoch:
-        #            best_valid_filename = params.exp_dir / "best-valid-loss.pt"
-        #            copyfile(src=filename, dst=best_valid_filename)
+                if params.best_valid_epoch == params.cur_epoch:
+                    best_valid_filename = params.exp_dir / "best-valid-loss.pt"
+                    copyfile(src=filename, dst=best_valid_filename)
 
     logging.info("Done!")
 
@@ -1684,56 +1414,7 @@ def main():
         run(rank=0, world_size=1, args=args)
 
 
-def test_wrapping():
-    import matplotlib.pyplot as plt
-
-    sp = spm.SentencePieceProcessor()
-    sp.load("./data/lang_bpe_256_punc/bpe.model")
-    vocab_size = sp.get_piece_size()
-    feat_dim = 80
-    embed = torch.nn.Embedding(vocab_size, 80).requires_grad_(False)
-
-    cut = json.load(open("./data/spectrogram/test.json"))
-
-    samples, sr = librosa.load(cut["recording"]["sources"][0]["source"])
-
-    fbank = Fbank(FbankConfig(num_mel_bins=feat_dim, sampling_rate=sr))
-
-    features = fbank.extract(samples=samples, sampling_rate=sr)
-    num_frames = len(features)
-
-    features = torch.tensor(features).unsqueeze(0).repeat(2, 1, 1)
-
-    features[1, num_frames - 100 :, :] = math.log(1e-10)
-
-    tokens = sp.encode(cut["supervisions"][0]["text"])
-    durations = [int(x * 100) for x in cut["supervisions"][0]["custom"]["durations"]]
-    noise = torch.randn(2, num_frames, feat_dim)
-
-    fig = plt.figure(figsize=(10, 100))
-    axes = fig.subplots(101, 2, sharex=True)
-    for t in range(100):
-        i = t
-        t = torch.tensor([[t / 100], [t / 100]])
-        xt, ut = get_xt_and_ut(
-            embed=embed,
-            y=[tokens, tokens[0:-20]],
-            durations=[durations, durations[0:-20]],
-            t=t,
-            noise=noise,
-            x1=features,
-        )
-        axes[i][0].imshow(xt[0].numpy().transpose())
-        axes[i][1].imshow(ut[0].numpy().transpose())
-
-    # axes[100][0].imshow(features[0].numpy().transpose())
-    # axes[100][1].imshow(features[1].numpy().transpose())
-
-    plt.savefig(f"fbank_wrapping_ut.png")
-
-
 if __name__ == "__main__":
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     main()
-    # test_wrapping()

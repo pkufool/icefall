@@ -98,6 +98,8 @@ if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
   log "Stage 4: Prepare tokens durations for LJSpeech"
   if [ ! -e data/spectrogram/.ljspeech_with_duration.done ]; then
     ./local/compute_alignment.py \
+      --checkpint exp/jit_script.pt \
+      --bpe-model data/lang_bpe_256_punc/bpe.model \
       --manifests-in data/spectrogram/ljspeech_cuts_all.jsonl.gz \
       --manifests-out data/spectrogram/ljspeech_cuts_with_durations_all.jsonl.gz
 
