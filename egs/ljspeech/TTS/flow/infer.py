@@ -236,7 +236,7 @@ def decode_one_batch(
     )
     gen_fbank = traj[-1, :].view([num_frames, -1, feat_dim]).permute(1, 2, 0)
 
-    audios = vocoder.forward(features.permute(0, 2, 1))
+    audios = vocoder.forward(gen_fbank)
 
     # torch.set_printoptions(profile="full")
 
@@ -313,7 +313,7 @@ def main():
     params = get_params()
     params.update(vars(args))
 
-    params.res_dir = params.exp_dir / "generated_wavs"
+    params.res_dir = params.exp_dir / "generated_wavs_step100"
 
     if params.iter > 0:
         params.suffix = f"iter-{params.iter}-avg-{params.avg}"
