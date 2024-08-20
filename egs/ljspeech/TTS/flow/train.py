@@ -27,6 +27,7 @@ import copy
 import math
 import os
 import optim
+import random
 
 import sentencepiece as spm
 import k2
@@ -61,11 +62,18 @@ from icefall.utils import (
     get_parameter_groups_with_lrs,
 )
 
-from model import TtsModel
+from model_reinforced import TtsModel
 
 from zipformer import Zipformer2
+from zipformer2 import Zipformer2 as Aligner
 
 from torchdyn.core import NeuralODE
+
+import sys
+
+sys.path.append("./hifi-gan/")
+from env import AttrDict
+from models import Generator as HiFiGAN
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -372,6 +380,39 @@ def get_parser():
         help="The scale factor of fbank feature",
     )
 
+    parser.add_argument(
+        "--use-classifier-free-guidance",
+        type=str2bool,
+        default=True,
+        help="whether to use classifier free guidance",
+    )
+
+    parser.add_argument(
+        "--classifier-free-guidance-ratio",
+        type=float,
+        default=0.15,
+        help="The drop rate of text conditions during training.",
+    )
+
+    parser.add_argument(
+        "--classifier-free-guidance-scale",
+        type=float,
+        default=4,
+        help="The scale that would apply to zero conditions during inference.",
+    )
+
+    parser.add_argument(
+        "--hifigan-config",
+        type=str,
+        help="Path to the configure file of hifigan",
+    )
+
+    parser.add_argument(
+        "--hifigan-checkpoint",
+        type=str,
+        help="Path to the checkpoint of hifigan",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -491,7 +532,6 @@ def load_checkpoint_if_available(
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
     encoder = Zipformer2(
-        output_downsampling_factor=2,
         downsampling_factor=_to_int_tuple(params.downsampling_factor),
         num_encoder_layers=_to_int_tuple(params.num_encoder_layers),
         encoder_dim=_to_int_tuple(params.encoder_dim),
@@ -512,17 +552,56 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
     return encoder
 
 
+def get_aligner_model(params: AttributeDict) -> nn.Module:
+    # small zipformer
+    # TODO: change to normal transformer
+    encoder = Aligner(
+        downsampling_factor=_to_int_tuple(params.downsampling_factor),
+        num_encoder_layers=_to_int_tuple("2,2,2,2,2,2"),
+        encoder_dim=_to_int_tuple("192,256,256,256,256,256"),
+        encoder_unmasked_dim=_to_int_tuple("192,192,192,192,192,192"),
+        query_head_dim=_to_int_tuple(params.query_head_dim),
+        pos_head_dim=_to_int_tuple(params.pos_head_dim),
+        value_head_dim=_to_int_tuple(params.value_head_dim),
+        pos_dim=params.pos_dim,
+        num_heads=_to_int_tuple(params.num_heads),
+        feedforward_dim=_to_int_tuple("512,768,768,768,768,768"),
+        cnn_module_kernel=_to_int_tuple(params.cnn_module_kernel),
+        dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
+        warmup_batches=4000.0,
+        causal=params.causal,
+        chunk_size=_to_int_tuple(params.chunk_size),
+        left_context_frames=_to_int_tuple(params.left_context_frames),
+    )
+    return encoder
+
+
 def get_model(params: AttributeDict) -> nn.Module:
     encoder = get_encoder_model(params)
+    aligner = get_aligner_model(params)
     model = TtsModel(
         encoder=encoder,
+        aligner=aligner,
         in_embed_dim=_to_int_tuple(params.encoder_dim)[0],
         out_embed_dim=max(_to_int_tuple(params.encoder_dim)),
+        aligner_in_dim=192,
+        aligner_out_dim=256,
         feat_dim=params.feat_dim,
-        in_feat_dim=params.feat_dim * 2,
+        text_embed_dim=params.feat_dim,
         vocab_size=params.vocab_size,
     )
     return model
+
+
+def get_vocoder(params):
+    with open(params.hifigan_config) as f:
+        h = AttrDict(json.load(f))
+    vocoder = HiFiGAN(h)
+
+    vocoder.load_state_dict(
+        torch.load(params.hifigan_checkpoint, map_location="cpu")["generator"]
+    )
+    return vocoder
 
 
 def pad_durations(durations: List[List[int]], num_frames: int) -> List[List[int]]:
@@ -597,14 +676,17 @@ def get_conditions(
     assert y_padded.shape == (batch_size, max_len)
 
     transcript_embed = embed(y_padded)  # (B, S + 1, F)
+    batch_size, _, text_embed_dim = transcript_embed.shape
 
-    assert transcript_embed.shape == (batch_size, max_len, feat_dim)
+    # assert transcript_embed.shape == (batch_size, max_len, feat_dim)
     assert transcript_pos.shape == (batch_size, num_frames)
 
     ans = torch.gather(
         transcript_embed,
         dim=1,
-        index=transcript_pos.unsqueeze(-1).expand(batch_size, num_frames, feat_dim),
+        index=transcript_pos.unsqueeze(-1).expand(
+            batch_size, num_frames, text_embed_dim
+        ),
     )
 
     return ans
@@ -659,7 +741,7 @@ def prepare_input(
 
     assert len(tokens) == len(durations), (len(tokens), len(durations))
 
-    return features, features_lens, tokens, durations, log_durations
+    return features * params.feat_scale, features_lens, tokens, durations, log_durations
 
 
 def get_time_shape(x):
@@ -750,6 +832,24 @@ def compute_fbank_loss(
         x1=x1,
     )  # (B, T, F)
 
+    if params.batch_idx_train > 2000 and params.use_classifier_free_guidance:
+        drop_conditions_ratio = params.classifier_free_guidance_ratio
+        if params.batch_idx_train > 2000 and params.batch_idx_train < 4000:
+            drop_conditions_ratio = (
+                (params.batch_idx_train - 2000) / 2000 * drop_conditions_ratio
+            )
+        mask = torch.ones(batch_size).to(device)
+        mask[torch.rand(batch_size).to(device) < drop_conditions_ratio] = 0
+        mask = mask.reshape(batch_size, 1, 1)
+        conditions = conditions * mask
+
+    if isinstance(model, DDP):
+        conditions = model.module.forward_aligner(conditions.permute(1, 0, 2)).permute(
+            1, 0, 2
+        )
+    else:
+        conditions = model.forward_aligner(conditions.permute(1, 0, 2)).permute(1, 0, 2)
+
     xt = torch.cat((xt, conditions), dim=2)  # (B, T, 2*F)
 
     ut = x1 - x0  # (B, T, F)
@@ -761,32 +861,39 @@ def compute_fbank_loss(
         except:  # noqa
             raise
         if rank == 0 and params.batch_idx_train % 100 == 0 and tb_writer is not None:
-            xt_ = torch.transpose(xt[0], 0, 1).detach().cpu()
-            ut_ = torch.transpose(ut[0], 0, 1).detach().cpu()
-            vt_ = torch.transpose(vt[0], 0, 1).detach().cpu()
-            tb_writer.add_image(
-                f"xt_ut_vt/xt_",
-                plot_tensor(xt_),
-                global_step=params.batch_idx_train,
-                dataformats="HWC",
-            )
-            save_plot(xt_, f"{params.exp_dir}/fbank/xt_{params.batch_idx_train}.png")
+            for x in range(batch_size):
+                xt_ = torch.transpose(xt[x], 0, 1).detach().cpu()
+                ut_ = torch.transpose(ut[x], 0, 1).detach().cpu()
+                vt_ = torch.transpose(vt[x], 0, 1).detach().cpu()
+                tb_writer.add_image(
+                    f"xt_ut_vt/xt_{x}",
+                    plot_tensor(xt_),
+                    global_step=params.batch_idx_train,
+                    dataformats="HWC",
+                )
+                save_plot(
+                    xt_, f"{params.exp_dir}/fbank/xt_{x}_{params.batch_idx_train}.png"
+                )
 
-            tb_writer.add_image(
-                f"xt_ut_vt/ut_",
-                plot_tensor(ut_),
-                global_step=params.batch_idx_train,
-                dataformats="HWC",
-            )
-            save_plot(ut_, f"{params.exp_dir}/fbank/ut_{params.batch_idx_train}.png")
+                tb_writer.add_image(
+                    f"xt_ut_vt/ut_{x}",
+                    plot_tensor(ut_),
+                    global_step=params.batch_idx_train,
+                    dataformats="HWC",
+                )
+                save_plot(
+                    ut_, f"{params.exp_dir}/fbank/ut_{x}_{params.batch_idx_train}.png"
+                )
 
-            tb_writer.add_image(
-                f"xt_ut_vt/vt_",
-                plot_tensor(vt_),
-                global_step=params.batch_idx_train,
-                dataformats="HWC",
-            )
-            save_plot(vt_, f"{params.exp_dir}/fbank/vt_{params.batch_idx_train}.png")
+                tb_writer.add_image(
+                    f"xt_ut_vt/vt_{x}",
+                    plot_tensor(vt_),
+                    global_step=params.batch_idx_train,
+                    dataformats="HWC",
+                )
+                save_plot(
+                    vt_, f"{params.exp_dir}/fbank/vt_{x}_{params.batch_idx_train}.png"
+                )
 
         loss = torch.mean((vt - ut) ** 2)
 
@@ -798,6 +905,7 @@ def compute_fbank_loss(
 
 def train_one_epoch(
     params: AttributeDict,
+    vocoder: nn.Module,
     model: Union[nn.Module, DDP],
     sp: spm.SentencePieceProcessor,
     optimizer: Optimizer,
@@ -870,19 +978,6 @@ def train_one_epoch(
         )
 
         try:
-            dur_loss, dur_loss_info = compute_duration_loss(
-                params=params,
-                model=model,
-                log_durations=log_durations,
-                tokens=tokens,
-                is_training=True,
-                rank=rank,
-            )
-
-            tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + dur_loss_info
-
-            scaler.scale(dur_loss).backward()
-
             loss, loss_info = compute_fbank_loss(
                 params=params,
                 model=model,
@@ -964,6 +1059,7 @@ def train_one_epoch(
             valid_info = compute_validation_loss(
                 params=params,
                 model=model,
+                vocoder=vocoder,
                 sp=sp,
                 valid_dl=valid_dl,
                 world_size=world_size,
@@ -990,7 +1086,9 @@ def train_one_epoch(
 def generate_samples(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
+    vocoder: nn.Module,
     features: Tensor,
+    durations: Tensor,
     tokens: List[List[int]],
     net_="normal",
     step: Optional[int] = 0,
@@ -1010,49 +1108,43 @@ def generate_samples(
 
     with torch.no_grad():
         inner_model = copy.deepcopy(inner_model)
-        t0 = torch.randn(y_padded.shape).unsqueeze(-1)  # (B, S, 1)
-        num_symbols = t0.shape[1]
-
-        duration_conditions = get_duration_conditions(
-            embed=inner_model.embed, y=tokens, device=device
-        )
-        duration_conditions = duration_conditions.permute(1, 0, 2)
-
-        duration_model_lambda = (
-            lambda t, dt, *args, **kwargs: inner_model.forward_duration(
-                t, torch.cat((dt, duration_conditions), dim=2)
-            )
-        )
-
-        node = NeuralODE(duration_model_lambda, solver="euler", sensitivity="adjoint")
-        traj = node.trajectory(
-            t0.permute(1, 0, 2).to(device),
-            t_span=torch.linspace(0, 1, 20).to(device),
-        )
-        gen_log_durations = traj[-1, :].view([num_symbols, -1]).permute(1, 0)
-
-        gen_durations = torch.exp(gen_log_durations).ceil().int().tolist()
-
         x0 = torch.randn_like(features)
         x1 = features
 
         conditions = get_conditions(
-            embed=inner_model.embed, y=tokens, durations=gen_durations, x1=features
+            embed=inner_model.embed, y=tokens, durations=durations, x1=features
         )
 
         batch_size, num_frames, feat_dim = x0.shape
-        conditions = conditions.permute(1, 0, 2)
 
-        model_lambda = lambda t, xt, *args, **kwargs: inner_model(
-            t, torch.cat((xt, conditions), dim=2)
-        )
+        conditions = conditions.permute(1, 0, 2)
+        conditions = inner_model.forward_aligner(conditions)
+
+        if params.use_classifier_free_guidance:
+            zero_conditions = torch.zeros_like(conditions)
+
+            model_lambda = lambda t, xt, *args, **kwargs: (
+                (1 + params.classifier_free_guidance_scale)
+                * inner_model(t, torch.cat((xt, conditions), dim=2))
+                - params.classifier_free_guidance_scale
+                * inner_model(t, torch.cat((xt, zero_conditions), dim=2))
+            )
+        else:
+            model_lambda = lambda t, xt, *args, **kwargs: inner_model(
+                t, torch.cat((xt, conditions), dim=2)
+            )
 
         node = NeuralODE(model_lambda, solver="euler", sensitivity="adjoint")
         traj = node.trajectory(
             x0.permute(1, 0, 2).to(device),
-            t_span=torch.linspace(0, 1, 100).to(device),
+            t_span=torch.linspace(0, 1, 50).to(device),
         )
-        gen_fbank = traj[-1, :].view([num_frames, -1, feat_dim]).permute(1, 0, 2)
+        gen_fbank = (
+            traj[-1, :].view([num_frames, -1, feat_dim]).permute(1, 0, 2)
+            / params.feat_scale
+        )
+
+        audios = vocoder.forward(gen_fbank.permute(0, 2, 1))
 
         if tb_writer is not None:
             for i in range(batch_size):
@@ -1062,10 +1154,13 @@ def generate_samples(
                 tb_writer.add_image(
                     f"fbank_{i}/ground_truth_",
                     plot_tensor(original),
-                    global_step=0,
+                    global_step=params.batch_idx_train,
                     dataformats="HWC",
                 )
-                save_plot(original, f"{params.exp_dir}/fbank/original_{i}.png")
+                save_plot(
+                    original,
+                    f"{params.exp_dir}/fbank/original_{params.batch_idx_train}_{i}.png",
+                )
 
                 tb_writer.add_image(
                     f"fbank_{i}/generated_",
@@ -1088,12 +1183,20 @@ def generate_samples(
                     start,
                     f"{params.exp_dir}/fbank/x0_{params.batch_idx_train}_{i}.png",
                 )
+
+                tb_writer.add_audio(
+                    f"audio_{i}/generated_",
+                    audios[i],
+                    params.batch_idx_train,
+                    22050,
+                )
         return gen_fbank
 
 
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
+    vocoder: nn.Module,
     sp: spm.SentencePieceProcessor,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
@@ -1113,16 +1216,6 @@ def compute_validation_loss(
             params=params, batch=batch, sp=sp, device=device
         )
 
-        loss, loss_info = compute_duration_loss(
-            params=params,
-            model=model,
-            log_durations=log_durations,
-            tokens=tokens,
-            is_training=False,
-        )
-        assert loss.requires_grad is False
-        tot_loss = tot_loss + loss_info
-
         loss, loss_info = compute_fbank_loss(
             params=params,
             model=model,
@@ -1138,7 +1231,9 @@ def compute_validation_loss(
             generate_samples(
                 params=params,
                 model=model,
+                vocoder=vocoder,
                 features=features,
+                durations=durations,
                 tokens=tokens,
                 step=params.batch_idx_train,
                 tb_writer=tb_writer,
@@ -1232,7 +1327,7 @@ def run(rank, world_size, args):
         setup_dist(rank, world_size, params.master_port)
 
     setup_logger(f"{params.exp_dir}/log/log-train")
-    os.makedirs(os.path.dirname(f"{params.exp_dir}/fbank"), exist_ok=True)
+    os.makedirs(f"{params.exp_dir}/fbank", exist_ok=True)
 
     logging.info("Training started")
 
@@ -1278,6 +1373,11 @@ def run(rank, world_size, args):
     )
 
     scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
+
+    vocoder = get_vocoder(params)
+    vocoder = vocoder.to(device)
+    vocoder.eval()
+    vocoder.remove_weight_norm()
 
     if checkpoints is not None:
         # load state_dict for optimizers
@@ -1346,6 +1446,7 @@ def run(rank, world_size, args):
         train_one_epoch(
             params=params,
             model=model,
+            vocoder=vocoder,
             sp=sp,
             optimizer=optimizer,
             scheduler=scheduler,

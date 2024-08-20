@@ -25,9 +25,12 @@ class TtsModel(nn.Module):
     def __init__(
         self,
         encoder: nn.Module,
+        aligner: nn.Module,
+        aligner_in_dim: int,
+        aligner_out_dim: int,
         in_embed_dim: int,
         out_embed_dim: int,
-        in_feat_dim: int,
+        text_embed_dim: int,
         feat_dim: int,
         vocab_size: int,
     ):
@@ -41,13 +44,18 @@ class TtsModel(nn.Module):
 
         self.encoder = encoder
 
-        self.in_proj = nn.Linear(in_feat_dim, in_embed_dim)
+        self.aligner = aligner
+
+        self.in_proj = nn.Linear(feat_dim + text_embed_dim, in_embed_dim)
         self.out_proj = nn.Linear(out_embed_dim, feat_dim)
 
-        self.dur_in_proj = nn.Linear(feat_dim + 1, in_embed_dim)
+        self.aligner_in_proj = nn.Linear(text_embed_dim, aligner_in_dim)
+        self.aligner_out_proj = nn.Linear(aligner_out_dim, text_embed_dim)
+
+        self.dur_in_proj = nn.Linear(text_embed_dim + 1, in_embed_dim)
         self.dur_out_proj = nn.Linear(out_embed_dim, 1)
 
-        self.embed = nn.Embedding(vocab_size, feat_dim)
+        self.embed = nn.Embedding(vocab_size, text_embed_dim)
 
     def forward(
         self, t: torch.Tensor, xt: torch.Tensor, *args, **kwargs
@@ -69,6 +77,12 @@ class TtsModel(nn.Module):
             t = t.repeat(xt.shape[1])
 
         return self.out_proj(self.encoder(t, self.in_proj(xt)))
+
+    def forward_aligner(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.aligner_in_proj(x)
+        x = self.aligner(x)
+        x = self.aligner_out_proj(x)
+        return x
 
     def forward_duration(
         self, t: torch.Tensor, dt: torch.Tensor, *args, **kwargs

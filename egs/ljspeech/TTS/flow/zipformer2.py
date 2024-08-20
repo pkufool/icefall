@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # Copyright    2022-2023  Xiaomi Corp.        (authors: Daniel Povey,
-#                                                       Zengwei Yao,
-#                                                       Wei Kang)
+#                                                       Zengwei Yao)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -25,13 +24,13 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
+
+# from encoder_interface import EncoderInterface
 from scaling import (
     Identity,  # more friendly to backward hooks than nn.Identity(), for diagnostic reasons.
 )
 from scaling import (
     ScaledLinear,  # not as in other dirs.. just scales down initial parameter values.
-    SwooshL,
-    SwooshR,
 )
 from scaling import (
     ActivationDropoutAndLinear,
@@ -48,27 +47,6 @@ from scaling import (
     softmax,
 )
 from torch import Tensor, nn
-
-
-def timestep_embedding(timesteps, dim, max_period=10000):
-    """Create sinusoidal timestep embeddings.
-
-    :param timesteps: a 1-D Tensor of N indices, one per batch element. These may be fractional.
-    :param dim: the dimension of the output.
-    :param max_period: controls the minimum frequency of the embeddings.
-    :return: an [N x dim] Tensor of positional embeddings.
-    """
-    half = dim // 2
-    freqs = torch.exp(
-        -math.log(max_period)
-        * torch.arange(start=0, end=half, dtype=torch.float32, device=timesteps.device)
-        / half
-    )
-    args = timesteps[:, None].float() * freqs[None]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-    return embedding
 
 
 class Zipformer2(nn.Module):
@@ -134,7 +112,6 @@ class Zipformer2(nn.Module):
         feedforward_dim: Union[int, Tuple[int]] = 1536,
         cnn_module_kernel: Union[int, Tuple[int]] = 31,
         pos_dim: int = 192,
-        time_embed_dim: int = 192,
         dropout: FloatLike = None,  # see code below for default
         warmup_batches: float = 4000.0,
         causal: bool = False,
@@ -175,7 +152,6 @@ class Zipformer2(nn.Module):
         self.causal = causal
         self.chunk_size = chunk_size
         self.left_context_frames = left_context_frames
-        self.time_embed_dim = time_embed_dim
 
         for u, d in zip(encoder_unmasked_dim, encoder_dim):
             assert u <= d
@@ -203,8 +179,6 @@ class Zipformer2(nn.Module):
             encoder = Zipformer2Encoder(
                 encoder_layer,
                 num_encoder_layers[i],
-                embed_dim=encoder_dim[i],
-                time_embed_dim=time_embed_dim,
                 pos_dim=pos_dim,
                 dropout=dropout,
                 warmup_begin=warmup_batches * (i + 1) / (num_encoders + 1),
@@ -224,12 +198,6 @@ class Zipformer2(nn.Module):
 
         self.encoders = nn.ModuleList(encoders)
 
-        self.time_embed = nn.Sequential(
-            nn.Linear(time_embed_dim, time_embed_dim * 2),
-            SwooshR(),
-            nn.Linear(time_embed_dim * 2, time_embed_dim),
-        )
-
         self.downsample_output = SimpleDownsample(
             max(encoder_dim), downsample=output_downsampling_factor, dropout=dropout
         )
@@ -238,9 +206,9 @@ class Zipformer2(nn.Module):
         """
         In eval mode, returns [1.0] * num_encoders; in training mode, returns a number of
         randomized feature masks, one per encoder.
-        On e.g. 15% of frames, these masks will zero out all enocder dims larger than
+        On e.g. 15% of frames, these masks will zero out all encoder dims larger than
         some supplied number, e.g. >256, so in effect on those frames we are using
-        a smaller encoer dim.
+        a smaller encoder dim.
 
         We generate the random masks at this level because we want the 2 masks to 'agree'
         all the way up the encoder stack. This will mean that the 1st mask will have
@@ -326,8 +294,9 @@ class Zipformer2(nn.Module):
 
     def forward(
         self,
-        t: Tensor,
-        xt: Tensor,
+        x: Tensor,
+        x_lens: Optional[Tensor] = None,
+        src_key_padding_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
@@ -345,10 +314,6 @@ class Zipformer2(nn.Module):
             - lengths, a tensor of shape (batch_size,) containing the number
               of frames in `embeddings` before padding.
         """
-        assert t.dim() == 1, t.shape
-        emb = self.time_embed(timestep_embedding(t, self.time_embed_dim))
-        x = xt
-
         outputs = []
         if torch.jit.is_scripting() or torch.jit.is_tracing():
             feature_masks = [1.0] * len(self.encoder_dim)
@@ -369,9 +334,13 @@ class Zipformer2(nn.Module):
 
             x = module(
                 x,
-                time_emb=emb,
                 chunk_size=chunk_size,
                 feature_mask=feature_masks[i],
+                src_key_padding_mask=(
+                    None
+                    if src_key_padding_mask is None
+                    else src_key_padding_mask[..., ::ds]
+                ),
                 attn_mask=attn_mask,
             )
             outputs.append(x)
@@ -383,6 +352,18 @@ class Zipformer2(nn.Module):
         x = self._get_full_dim_output(outputs)
 
         return x
+
+        # x = self.downsample_output(x)
+        ## class Downsample has this rounding behavior..
+        # assert self.output_downsampling_factor == 2, self.output_downsampling_factor
+        # if torch.jit.is_scripting() or torch.jit.is_tracing():
+        #    lengths = (x_lens + 1) // 2
+        # else:
+        #    with warnings.catch_warnings():
+        #        warnings.simplefilter("ignore")
+        #        lengths = (x_lens + 1) // 2
+
+        # return x, lengths
 
     def _get_attn_mask(
         self, x: Tensor, chunk_size: int, left_context_chunks: int
@@ -571,9 +552,9 @@ class Zipformer2EncoderLayer(nn.Module):
     Args:
         embed_dim: the number of expected features in the input (required).
         nhead: the number of heads in the multiheadattention models (required).
-        feedforward_dim: the dimension of the feedforward network model (default=2048).
+        feedforward_dim: the dimension of the feedforward network model (required).
         dropout: the dropout value (default=0.1).
-        cnn_module_kernel (int): Kernel size of convolution module.
+        cnn_module_kernel (int): Kernel size of convolution module (default=31).
 
     Examples::
         >>> encoder_layer = Zipformer2EncoderLayer(embed_dim=512, nhead=8)
@@ -763,7 +744,6 @@ class Zipformer2EncoderLayer(nn.Module):
         self,
         src: Tensor,
         pos_emb: Tensor,
-        time_emb: Tensor,
         chunk_size: int = -1,
         attn_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
@@ -802,8 +782,6 @@ class Zipformer2EncoderLayer(nn.Module):
             attn_mask=attn_mask,
             key_padding_mask=src_key_padding_mask,
         )
-
-        src = src + time_emb.unsqueeze(0)
 
         src = src + self.feed_forward1(src)
 
@@ -845,9 +823,6 @@ class Zipformer2EncoderLayer(nn.Module):
             conv_skip_rate = 0.0
         else:
             conv_skip_rate = float(self.conv_skip_rate) if self.training else 0.0
-
-        src = src + time_emb.unsqueeze(0)
-
         src = src + self.sequence_dropout(
             self.conv_module1(
                 src, chunk_size=chunk_size, src_key_padding_mask=src_key_padding_mask
@@ -878,9 +853,6 @@ class Zipformer2EncoderLayer(nn.Module):
             conv_skip_rate = 0.0
         else:
             conv_skip_rate = float(self.conv_skip_rate) if self.training else 0.0
-
-        src = src + time_emb.unsqueeze(0)
-
         src = src + self.sequence_dropout(
             self.conv_module2(
                 src, chunk_size=chunk_size, src_key_padding_mask=src_key_padding_mask
@@ -1043,8 +1015,6 @@ class Zipformer2Encoder(nn.Module):
         self,
         encoder_layer: nn.Module,
         num_layers: int,
-        embed_dim: int,
-        time_embed_dim: int,
         pos_dim: int,
         dropout: float,
         warmup_begin: float,
@@ -1057,17 +1027,12 @@ class Zipformer2Encoder(nn.Module):
             pos_dim, dropout_rate=0.15, length_factor=1.0
         )
 
-        self.time_emb = nn.Sequential(
-            SwooshR(),
-            nn.Linear(time_embed_dim, embed_dim),
-        )
-
         self.layers = nn.ModuleList(
             [copy.deepcopy(encoder_layer) for i in range(num_layers)]
         )
         self.num_layers = num_layers
 
-        assert 0 <= warmup_begin <= warmup_end
+        assert 0 <= warmup_begin <= warmup_end, (warmup_begin, warmup_end)
 
         delta = (1.0 / num_layers) * (warmup_end - warmup_begin)
         cur_begin = warmup_begin  # interpreted as a training batch index
@@ -1083,7 +1048,6 @@ class Zipformer2Encoder(nn.Module):
     def forward(
         self,
         src: Tensor,
-        time_emb: Tensor,
         chunk_size: int = -1,
         feature_mask: Union[Tensor, float] = 1.0,
         attn_mask: Optional[Tensor] = None,
@@ -1105,8 +1069,6 @@ class Zipformer2Encoder(nn.Module):
         Returns: a Tensor with the same shape as src.
         """
         pos_emb = self.encoder_pos(src)
-        time_emb = self.time_emb(time_emb)
-
         output = src
 
         if not torch.jit.is_scripting() and not torch.jit.is_tracing():
@@ -1116,7 +1078,6 @@ class Zipformer2Encoder(nn.Module):
             output = mod(
                 output,
                 pos_emb,
-                time_emb=time_emb,
                 chunk_size=chunk_size,
                 attn_mask=attn_mask,
                 src_key_padding_mask=src_key_padding_mask,
@@ -1220,7 +1181,7 @@ class BypassModule(nn.Module):
     def _get_bypass_scale(self, batch_size: int):
         # returns bypass-scale of shape (num_channels,),
         # or (batch_size, num_channels,).  This is actually the
-        # scale on the non-residual term, so 0 correponds to bypassing
+        # scale on the non-residual term, so 0 corresponds to bypassing
         # this module.
         if torch.jit.is_scripting() or torch.jit.is_tracing() or not self.training:
             return self.bypass_scale
@@ -1273,7 +1234,6 @@ class DownsampledZipformer2Encoder(nn.Module):
     def forward(
         self,
         src: Tensor,
-        time_emb: Tensor,
         chunk_size: int = -1,
         feature_mask: Union[Tensor, float] = 1.0,
         attn_mask: Optional[Tensor] = None,
@@ -1301,7 +1261,6 @@ class DownsampledZipformer2Encoder(nn.Module):
 
         src = self.encoder(
             src,
-            time_emb=time_emb,
             chunk_size=chunk_size // ds,
             feature_mask=feature_mask,
             attn_mask=attn_mask,
@@ -1426,12 +1385,12 @@ class CompactRelPositionalEncoding(torch.nn.Module):
     when encoding absolute position, but not important when encoding relative position because there
     is now no need to compare two large offsets with each other.
 
-    Our embedding works done by projecting the interval [-infinity,infinity] to a finite interval
-    using the atan() function, before doing the fourier transform of that fixed interval.  The
+    Our embedding works by projecting the interval [-infinity,infinity] to a finite interval
+    using the atan() function, before doing the Fourier transform of that fixed interval.  The
     atan() function would compress the "long tails" too small,
     making it hard to distinguish between different magnitudes of large offsets, so we use a logarithmic
     function to compress large offsets to a smaller range before applying atan().
-    Scalings are chosen in such a way that the embedding can clearly distinguish invidual offsets as long
+    Scalings are chosen in such a way that the embedding can clearly distinguish individual offsets as long
     as they are quite close to the origin, e.g. abs(offset) <= about sqrt(embedding_dim)
 
 
@@ -1453,10 +1412,10 @@ class CompactRelPositionalEncoding(torch.nn.Module):
         """Construct a CompactRelPositionalEncoding object."""
         super(CompactRelPositionalEncoding, self).__init__()
         self.embed_dim = embed_dim
-        assert embed_dim % 2 == 0
+        assert embed_dim % 2 == 0, embed_dim
         self.dropout = Dropout2(dropout_rate)
         self.pe = None
-        assert length_factor >= 1.0
+        assert length_factor >= 1.0, length_factor
         self.length_factor = length_factor
         self.extend_pe(torch.tensor(0.0).expand(max_len))
 
@@ -1600,7 +1559,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         # due to how Adam/ScaledAdam work, it can learn a fairly large nonzero
         # bias because the small numerical roundoff tends to have a non-random
         # sign.  This module is intended to prevent that.  Use a very small
-        # probability; that should be suffixient to fix the problem.
+        # probability; that should be sufficient to fix the problem.
         self.balance_keys = Balancer(
             key_head_dim * num_heads,
             channel_dim=-1,
@@ -1616,7 +1575,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
             pos_dim, num_heads * pos_head_dim, bias=False, initial_scale=0.05
         )
 
-        # the following are for diagnosics only, see --print-diagnostics option
+        # the following are for diagnostics only, see --print-diagnostics option
         self.copy_pos_query = Identity()
         self.copy_query = Identity()
 
@@ -1654,7 +1613,11 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         k = x[..., query_dim : 2 * query_dim]
         # p is the position-encoding query
         p = x[..., 2 * query_dim :]
-        assert p.shape[-1] == num_heads * pos_head_dim
+        assert p.shape[-1] == num_heads * pos_head_dim, (
+            p.shape[-1],
+            num_heads,
+            pos_head_dim,
+        )
 
         q = self.copy_query(q)  # for diagnostics only, does nothing.
         k = self.whiten_keys(self.balance_keys(k))  # does nothing in the forward pass.
