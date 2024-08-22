@@ -32,12 +32,13 @@ import torch
 import torch.nn as nn
 from tts_datamodule import LJSpeechTtsDataModule
 
-from train import (
+from train_no_dur import (
     add_model_arguments,
     get_conditions,
     get_duration_conditions,
     get_model,
     get_params,
+    prepare_input,
 )
 
 from icefall.checkpoint import (
@@ -117,8 +118,22 @@ def get_parser():
     parser.add_argument(
         "--bpe-model",
         type=str,
-        default="data/lang_bpe_500/bpe.model",
+        default="data/lang_bpe_256_punc/bpe.model",
         help="Path to the BPE model",
+    )
+
+    parser.add_argument(
+        "--feat-scale",
+        type=float,
+        default=0.1,
+        help="The scale factor of fbank feature",
+    )
+
+    parser.add_argument(
+        "--zero-condition-scale",
+        type=float,
+        default=2,
+        help="The scale of zero condition diffsion during inference.",
     )
 
     parser.add_argument(
@@ -181,71 +196,88 @@ def decode_one_batch(
     """
     device = next(model.parameters()).device
 
-    texts = batch["text"]
     cut_ids = [cut.id for cut in batch["cut"]]
 
-    features = batch["features"]
-    assert features.ndim == 3
+    # texts = batch["text"]
+    # features = batch["features"]
+    # assert features.ndim == 3
 
-    features = features.to(device)
-    # at entry, feature is (N, T, C)
+    # features = features.to(device)
+    # # at entry, feature is (N, T, C)
+    # tokens = sp.encode(texts)
 
-    tokens = sp.encode(texts)
+    features, _, tokens, durations, _ = prepare_input(params, batch, sp, device)
 
-    y_padded = to_tensor(tokens).to(device)
+    # y_padded = to_tensor(tokens).to(device)
 
-    t0 = torch.randn(y_padded.shape).unsqueeze(-1)  # (B, S, 1)
-    num_symbols = t0.shape[1]
+    # t0 = torch.randn(y_padded.shape).unsqueeze(-1)  # (B, S, 1)
+    # num_symbols = t0.shape[1]
 
-    duration_conditions = get_duration_conditions(
-        embed=model.embed, y=tokens, device=device
-    )
-    duration_conditions = duration_conditions.permute(1, 0, 2)
+    # duration_conditions = get_duration_conditions(
+    #    embed=model.embed, y=tokens, device=device
+    # )
+    # duration_conditions = duration_conditions.permute(1, 0, 2)
 
-    duration_model_lambda = lambda t, dt, *args, **kwargs: model.forward_duration(
-        t, torch.cat((dt, duration_conditions), dim=2)
-    )
+    # duration_model_lambda = lambda t, dt, *args, **kwargs: model.forward_duration(
+    #    t, torch.cat((dt, duration_conditions), dim=2)
+    # )
 
-    node = NeuralODE(duration_model_lambda, solver="euler", sensitivity="adjoint")
-    traj = node.trajectory(
-        t0.permute(1, 0, 2).to(device),
-        t_span=torch.linspace(0, 1, 20).to(device),
-    )
-    gen_log_durations = traj[-1, :].view([num_symbols, -1]).permute(1, 0)
+    # node = NeuralODE(duration_model_lambda, solver="euler", sensitivity="adjoint")
+    # traj = node.trajectory(
+    #    t0.permute(1, 0, 2).to(device),
+    #    t_span=torch.linspace(0, 1, 20).to(device),
+    # )
+    # gen_log_durations = traj[-1, :].view([num_symbols, -1]).permute(1, 0)
 
-    gen_durations = torch.exp(gen_log_durations).ceil().int().tolist()
+    # gen_durations = torch.exp(gen_log_durations).ceil().int().tolist()
 
     x0 = torch.randn_like(features)
     x1 = features
 
+    # conditions = get_conditions(
+    # embed=model.embed, y=tokens, durations=gen_durations, x1=features
+    # )
     conditions = get_conditions(
-        embed=model.embed, y=tokens, durations=gen_durations, x1=features
+        embed=model.embed, y=tokens, durations=durations, x1=features
     )
 
     batch_size, num_frames, feat_dim = x0.shape
     conditions = conditions.permute(1, 0, 2)
 
-    model_lambda = lambda t, xt, *args, **kwargs: model(
-        t, torch.cat((xt, conditions), dim=2)
+    zero_conditions = torch.zeros_like(conditions)
+
+    model_lambda = lambda t, xt, *args, **kwargs: (
+        (1 + params.zero_condition_scale) * model(t, torch.cat((xt, conditions), dim=2))
+        - params.zero_condition_scale
+        * model(t, torch.cat((xt, zero_conditions), dim=2))
     )
+
+    # model_lambda = lambda t, xt, *args, **kwargs: model(
+    # t, torch.cat((xt, conditions), dim=2)
+    # )
 
     node = NeuralODE(model_lambda, solver="euler", sensitivity="adjoint")
     traj = node.trajectory(
         x0.permute(1, 0, 2).to(device),
-        t_span=torch.linspace(0, 1, 100).to(device),
+        t_span=torch.linspace(0, 1, 20).to(device),
     )
-    gen_fbank = traj[-1, :].view([num_frames, -1, feat_dim]).permute(1, 2, 0)
+    gen_fbank = (
+        traj[-1, :].view([num_frames, -1, feat_dim]).permute(1, 2, 0)
+        / params.feat_scale
+    )
 
     audios = vocoder.forward(gen_fbank)
 
     # torch.set_printoptions(profile="full")
+    wav_dir = f"{params.res_dir}/step_20_scale_{params.zero_condition_scale}"
+    os.makedirs(wav_dir, exist_ok=True)
 
     for i in range(audios.shape[0]):
         audio = audios[i]
         v_min, v_max = audio.min(), audio.max()
         audio = (audio - v_min) / (v_max - v_min) * 2 - 1
         audio = audio.cpu().squeeze().numpy()
-        write(f"{params.res_dir}/{cut_ids[i]}.wav", 22050, audio)
+        write(f"{wav_dir}/{cut_ids[i]}.wav", 22050, audio)
 
 
 def decode_dataset(
@@ -313,7 +345,7 @@ def main():
     params = get_params()
     params.update(vars(args))
 
-    params.res_dir = params.exp_dir / "generated_wavs_step100"
+    params.res_dir = params.exp_dir / "generated_wavs"
 
     if params.iter > 0:
         params.suffix = f"iter-{params.iter}-avg-{params.avg}"
