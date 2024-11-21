@@ -105,6 +105,38 @@ Usage:
     --nbest-scale 1.0 \
     --lm-dir data/lm \
     --decoding-method attention-decoder-rescoring-with-ngram
+
+(9) ctc-prefix-beam-search
+./zipformer/ctc_decode.py \
+    --epoch 30 \
+    --avg 15 \
+    --exp-dir ./zipformer/exp \
+    --use-ctc 1 \
+    --max-duration 100 \
+    --decoding-method ctc-prefix-beam-search
+
+(10) ctc-prefix-beam-search-attention-decoder-rescoring
+./zipformer/ctc_decode.py \
+    --epoch 30 \
+    --avg 15 \
+    --exp-dir ./zipformer/exp \
+    --use-ctc 1 \
+    --max-duration 100 \
+    --decoding-method ctc-prefix-beam-search-attention-decoder-rescoring
+
+(11) ctc-prefix-beam-search-shallow-fussion
+./zipformer/ctc_decode.py \
+    --epoch 30 \
+    --avg 15 \
+    --exp-dir ./zipformer/exp \
+    --use-ctc 1 \
+    --nnlm-type rnn \
+    --lm-exp-dir rnn-lm/exp \
+    --lm-epoch 99 \
+    --lm-avg 1 \
+    --lm-vocab-size 500 \
+    --max-duration 100 \
+    --decoding-method ctc-prefix-beam-search-shallow-fussion
 """
 
 
