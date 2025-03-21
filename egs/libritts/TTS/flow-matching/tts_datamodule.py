@@ -247,8 +247,10 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
             batch["text"] = text
 
         if self.return_tokens:
-            tokens = [cut.tokens for cut in cuts]
+            tokens = [cut.supervisions[0].tokens for cut in cuts]
+            token_ids = [cut.supervisions[0].token_ids for cut in cuts]
             batch["tokens"] = tokens
+            batch["token_ids"] = token_ids
 
         if self.return_spk_ids:
             batch["speakers"] = [cut.supervisions[0].speaker for cut in cuts]
@@ -355,7 +357,7 @@ class TtsDataModule:
         group.add_argument(
             "--n-mels",
             type=int,
-            default=80,
+            default=100,
             help="The number of mel bins for the feature extraction.",
         )
         group.add_argument(
@@ -623,21 +625,31 @@ class TtsDataModule:
             train-clean-360 and train-other-500 cuts"
         )
         return load_manifest_lazy(
-            self.args.manifest_dir / "libritts_cuts_with_tokens_train-all-shuf.jsonl.gz"
+            self.args.manifest_dir / "libritts_cuts_train-all-shuf.jsonl.gz"
+        )
+
+    @lru_cache()
+    def train_clean_460_cuts(self) -> CutSet:
+        logging.info(
+            "About to get the shuffled train-clean-100, \
+            train-clean-360 cuts"
+        )
+        return load_manifest_lazy(
+            self.args.manifest_dir / "libritts_cuts_train-clean-460.jsonl.gz"
         )
 
     @lru_cache()
     def dev_clean_cuts(self) -> CutSet:
         logging.info("About to get dev-clean cuts")
         return load_manifest_lazy(
-            self.args.manifest_dir / "libritts_cuts_with_tokens_dev-clean.jsonl.gz"
+            self.args.manifest_dir / "libritts_cuts_dev-clean.jsonl.gz"
         )
 
     @lru_cache()
     def test_clean_cuts(self) -> CutSet:
         logging.info("About to get test-clean cuts")
         return load_manifest_lazy(
-            self.args.manifest_dir / "libritts_cuts_with_tokens_test-clean.jsonl.gz"
+            self.args.manifest_dir / "libritts_cuts_test-clean.jsonl.gz"
         )
 
     @lru_cache()

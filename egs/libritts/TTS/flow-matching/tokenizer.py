@@ -18,9 +18,12 @@
 import logging
 from typing import Dict, List
 
-import sentencepiece as spm
+from text_normalizer import custom_english_cleaners
 
-from .text_normalizer import custom_english_cleaners
+try:
+    import sentencepiece as spm
+except Exception as ex:
+    raise RuntimeError(f"{ex}\nPlease run\npip install sentencepiece")
 
 try:
     from piper_phonemize import phonemize_espeak
@@ -32,19 +35,18 @@ except Exception as ex:
 
 
 class Tokenizer(object):
-    def __init__(self, type: str, token_file: str):
+    def __init__(self, token_type: str, token_file: str):
         """
         Args:
-          type: the type of tokenizer, e.g., bpe, letter, phone.
-          tokens: the file that contains information that maps tokens to ids,
+          token_type: the type of tokenizer, e.g., bpe, letter, phone.
+          token_file: the file that contains information that maps tokens to ids,
             which is a text file with '{token} {token_id}' per line if type is
             char or phone, otherwise it is a bpe_model file.
         """
-        self.type = type
-        assert type in ["bpe", "letter", "phone"]
-        # Parse token file
+        self.token_type = token_type
+        assert token_type in ["bpe", "letter", "phone"], token_type
 
-        if type == "bpe":
+        if token_type == "bpe":
             self.sp = spm.SentencePieceProcessor()
             self.sp.load(token_file)
             self.token2id: Dict[str, int] = {
@@ -80,6 +82,7 @@ class Tokenizer(object):
         self,
         texts: List[str],
         intersperse_blank: bool = False,
+        return_tokens: bool = False,
         lang: str = "en-us",
     ) -> List[List[int]]:
         """
@@ -99,15 +102,19 @@ class Tokenizer(object):
             # Text normalization
             texts[i] = custom_english_cleaners(texts[i])
 
-        if self.type == "bpe":
-            token_ids_list = self.sp.encode(texts)
+        tokens_list = []
+        token_ids_list = []
 
-        elif self.type == "phone":
-            token_ids_list = []
+        if self.token_type == "bpe":
+            token_ids_list = self.sp.encode(texts)
+            if return_tokens:
+                tokens_list = self.sp.encode(texts, out_type=str)
+
+        elif self.token_type == "phone":
             for text in texts:
-                tokens_list = phonemize_espeak(text, lang)
+                raw_tokens_list = phonemize_espeak(text, lang)
                 tokens = []
-                for t in tokens_list:
+                for t in raw_tokens_list:
                     tokens.extend(t)
                 token_ids = []
                 for t in tokens:
@@ -115,29 +122,36 @@ class Tokenizer(object):
                         logging.warning(f"Skip OOV {t}")
                         continue
                     token_ids.append(self.token2id[t])
-
+                if return_tokens:
+                    tokens_list.append(tokens)
                 token_ids_list.append(token_ids)
         else:
-            token_ids_list = []
             for text in texts:
                 token_ids = []
+                tokens = []
                 for t in text:
                     if t not in self.token2id:
                         logging.warning(f"Skip OOV {t}")
                         continue
                     token_ids.append(self.token2id[t])
+                    tokens.append(t)
 
                 token_ids_list.append(token_ids)
+                if return_tokens:
+                    tokens_list.append(tokens)
 
         if intersperse_blank:
             for i in range(len(token_ids_list)):
                 token_ids_list[i] = intersperse(token_ids_list[i], self.pad_id)
 
+        if return_tokens:
+            return token_ids_list, tokens_list
+
         return token_ids_list
 
     def tokens_to_token_ids(
         self,
-        tokens_list: List[str],
+        tokens_list: List[List[str]],
         intersperse_blank: bool = False,
     ) -> List[List[int]]:
         """

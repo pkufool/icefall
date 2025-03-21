@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Copyright         2024  Xiaomi Corp.        (authors: Wei Kang,
-#                                                       Han Zhu)
+# Copyright         2024  Xiaomi Corp.        (authors: Han Zhu,
+#                                                       Wei Kang)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -20,6 +20,7 @@ import argparse
 import copy
 import logging
 import os
+import random
 from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -28,10 +29,10 @@ import optim
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
-from checkpoint import load_checkpoint, resume_checkpoint, save_checkpoint
+from checkpoint import load_checkpoint, save_checkpoint
 from lhotse.cut import Cut
 from lhotse.utils import fix_random_seed
-from model import get_model
+from model import get_distill_model, get_model
 from optim import Eden, ScaledAdam
 from tokenizer import Tokenizer
 from torch import Tensor
@@ -39,8 +40,19 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torch.utils.tensorboard import SummaryWriter
+from train import (
+    add_model_arguments,
+    get_params,
+    remove_short_and_long_utt,
+    tokenize_text,
+)
 from tts_datamodule import TtsDataModule
-from utils import get_adjusted_batch_count, prepare_input, set_batch_count
+from utils import (
+    condition_time_mask,
+    get_adjusted_batch_count,
+    prepare_input,
+    set_batch_count,
+)
 
 from icefall import diagnostics
 from icefall.checkpoint import (
@@ -49,209 +61,17 @@ from icefall.checkpoint import (
     update_averaged_model,
 )
 from icefall.dist import cleanup_dist, setup_dist
-from icefall.env import get_env_info
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import (
     AttributeDict,
     MetricsTracker,
     get_parameter_groups_with_lrs,
+    make_pad_mask,
     setup_logger,
     str2bool,
 )
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
-
-
-def add_model_arguments(parser: argparse.ArgumentParser):
-    parser.add_argument(
-        "--fm-decoder-downsampling-factor",
-        type=str,
-        default="1,2,4,2,1",
-        help="""
-        Downsampling factor for each stack of encoder layers in zipformer.
-        (for flow-matching decoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--fm-decoder-num-layers",
-        type=str,
-        default="2,2,4,4,4",
-        help="""
-        Number of zipformer encoder layers per stack, comma separated.
-        (for flow-matching decoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--fm-decoder-cnn-module-kernel",
-        type=str,
-        default="31,15,7,15,31",
-        help="""
-        Sizes of convolutional kernels in convolution modules in each
-        encoder stack: a single int (shared by all stacks) or comma-separated
-        list. (for flow-matching decoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--fm-decoder-feedforward-dim",
-        type=int,
-        default=1536,
-        help="""
-        Feedforward dimension of the zipformer encoder layers per stack: a single
-        int (shared by all stacks). (for flow-matching decoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--fm-decoder-num-heads",
-        type=int,
-        default=4,
-        help="""
-        Number of attention heads in the zipformer encoder layers: a single
-        int (shared by all stacks). (for flow-matching decoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--fm-decoder-dim",
-        type=int,
-        default=512,
-        help="""
-        Embedding dimension in encoder stacks: a single int (shared by all stacks).
-        (for flow-matching decoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--text-encoder-downsampling-factor",
-        type=str,
-        default="1",
-        help="""
-        Downsampling factor for each stack of encoder layers. (for text encoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--text-encoder-num-layers",
-        type=str,
-        default="4",
-        help="""
-        Number of zipformer encoder layers per stack, comma separated. (for text encoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--text-encoder-feedforward-dim",
-        type=int,
-        default=512,
-        help="""
-        Feedforward dimension of the zipformer encoder layers, per stack.
-        (for text encoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--text-encoder-cnn-module-kernel",
-        type=str,
-        default="9",
-        help="""
-        Sizes of convolutional kernels in convolution modules in each encoder stack:
-        a single int (shared by all stacks) or comma-separated list. (for text encoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--text-encoder-num-heads",
-        type=int,
-        default=4,
-        help="""
-        Number of attention heads in the zipformer encoder layers: a single int
-        (shared by all stacks). (for text encoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--text-encoder-dim",
-        type=int,
-        default=192,
-        help="""
-        Embedding dimension in encoder stacks: a single int. (for text encoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--query-head-dim",
-        type=int,
-        default=32,
-        help="""
-        Query/key dimension per head in encoder stacks.
-        (for both flow-matching decoder and text encoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--value-head-dim",
-        type=int,
-        default=12,
-        help="""
-        Value dimension per head in encoder stacks.
-        (for both flow-matching decoder and text encoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--pos-head-dim",
-        type=int,
-        default=4,
-        help="""
-        Positional-encoding dimension per head in encoder stacks.
-        (for both flow-matching decoder and text encoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--pos-dim",
-        type=int,
-        default=48,
-        help="""
-        Positional-encoding embedding dimension.
-        (for both flow-matching decoder and text encoder)
-        """,
-    )
-
-    parser.add_argument(
-        "--time-embed-dim",
-        type=int,
-        default=192,
-        help="Embedding dimension of timestamps embedding.",
-    )
-
-    parser.add_argument(
-        "--text-embed-dim",
-        type=int,
-        default=192,
-        help="Embedding dimension of text embedding.",
-    )
-
-    parser.add_argument(
-        "--token-type",
-        type=str,
-        default="bpe",
-        choices=["phone", "bpe", "letter"],
-        help="Input token type of TTS model",
-    )
-
-    parser.add_argument(
-        "--token-file",
-        type=str,
-        default="data/lang_bpe_500/bpe.model",
-        help="""The file that contains information that maps tokens to ids,
-        which is a text file with '{token} {token_id}' per line if type is
-        char or phone, otherwise it is a bpe_model file.
-        """,
-    )
 
 
 def get_parser():
@@ -283,7 +103,7 @@ def get_parser():
     parser.add_argument(
         "--num-epochs",
         type=int,
-        default=60,
+        default=6,
         help="Number of epochs to train.",
     )
 
@@ -298,26 +118,15 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--start-batch",
-        type=int,
-        default=0,
-        help="""If positive, --start-epoch is ignored and
-        it loads the checkpoint from exp-dir/checkpoint-{start_batch}.pt
-        """,
-    )
-
-    parser.add_argument(
-        "--checkpoint",
+        "--teacher-model",
         type=str,
-        default=None,
-        help="""Checkpoints of pre-trained models, will load it if not None
-        """,
+        help="""Checkpoints of pre-trained teacher model""",
     )
 
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="flow-matching/exp",
+        default="flow-matching/exp_distill",
         help="""The experiment dir.
         It specifies the directory where all training related
         files, e.g., checkpoints, log, etc, are saved
@@ -325,31 +134,25 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--base-lr", type=float, default=0.02, help="The base learning rate."
+        "--base-lr", type=float, default=0.001, help="The base learning rate."
     )
 
     parser.add_argument(
         "--lr-batches",
         type=float,
-        default=7500,
+        default=1000000.0,
         help="""Number of steps that affects how rapidly the learning rate
-        decreases. We suggest not to change this.""",
+        decreases. It is set to a very large value here to prevent the lr from decaying too fast
+        during fine-tuning.""",
     )
 
     parser.add_argument(
         "--lr-epochs",
         type=float,
-        default=10,
+        default=1000.0,
         help="""Number of epochs that affects how rapidly the learning rate decreases.
-        """,
-    )
-
-    parser.add_argument(
-        "--lr-hours",
-        type=float,
-        default=0,
-        help="""If positive, --epoch is ignored and it specifies the number of hours 
-        that affects how rapidly the learning rate decreases.
+        It is set to a very large value here to prevent the lr from decaying too fast
+        during fine-tuning.
         """,
     )
 
@@ -434,13 +237,17 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--condition-drop-ratio",
+        "--ema-decay",
         type=float,
-        default=0.2,
-        help="""
-        The drop rate of text condition during training 
-        (for classifier-free guidance).
-        """,
+        default=0.999,
+        help="The EMA decay factor of target model in distillation.",
+    )
+
+    parser.add_argument(
+        "--max-guidance-scale",
+        type=float,
+        default=3.0,
+        help="The maximum classifier-free guidance ratio in distillation.",
     )
 
     add_model_arguments(parser)
@@ -448,67 +255,66 @@ def get_parser():
     return parser
 
 
-def get_params() -> AttributeDict:
-    """Return a dict containing training parameters.
+def ema(new_model, ema_model, decay):
+    if isinstance(new_model, DDP):
+        new_model = new_model.module
+    if isinstance(ema_model, DDP):
+        ema_model = ema_model.module
+    new_model_dict = new_model.state_dict()
+    ema_model_dict = ema_model.state_dict()
+    for key in new_model_dict.keys():
+        ema_model_dict[key].data.copy_(
+            ema_model_dict[key].data * decay + new_model_dict[key].data * (1 - decay)
+        )
 
-    All training related parameters that are not passed from the commandline
-    are saved in the variable `params`.
 
-    Commandline options are merged into `params` after they are parsed, so
-    you can also access them via `params`.
+def resume_checkpoint(
+    params: AttributeDict, model: nn.Module, model_avg: nn.Module, model_ema: nn.Module
+) -> Optional[Dict[str, Any]]:
+    """Load checkpoint from file.
 
-    Explanation of options saved in `params`:
+    If params.start_epoch is larger than 1, it will load the checkpoint from
+    `params.start_epoch - 1`.
 
-        - best_train_loss: Best training loss so far. It is used to select
-                           the model that has the lowest training loss. It is
-                           updated during the training.
+    Apart from loading state dict for `model` and `optimizer` it also updates
+    `best_train_epoch`, `best_train_loss`, `best_valid_epoch`,
+    and `best_valid_loss` in `params`.
 
-        - best_valid_loss: Best validation loss so far. It is used to select
-                           the model that has the lowest validation loss. It is
-                           updated during the training.
-
-        - best_train_epoch: It is the epoch that has the best training loss.
-
-        - best_valid_epoch: It is the epoch that has the best validation loss.
-
-        - batch_idx_train: Used to writing statistics to tensorboard. It
-                           contains number of batches trained so far across
-                           epochs.
-
-        - log_interval:  Print training loss if batch_idx % log_interval` is 0
-
-        - reset_interval: Reset statistics if batch_idx % reset_interval is 0
-
-        - valid_interval:  Run validation if batch_idx % valid_interval is 0
-
-        - feature_dim: The model input dim. It has to match the one used
-                       in computing features.
-
+    Args:
+      params:
+        The return value of :func:`get_params`.
+      model:
+        The training model.
+    Returns:
+      Return a dict containing previously saved training info.
     """
-    params = AttributeDict(
-        {
-            "best_train_loss": float("inf"),
-            "best_valid_loss": float("inf"),
-            "best_train_epoch": -1,
-            "best_valid_epoch": -1,
-            "batch_idx_train": 0,
-            "log_interval": 50,
-            "reset_interval": 200,
-            "valid_interval": None,
-            "sample_rate": 24000,
-            "frame_shift_ms": 256 / 24000 * 1000,
-            "feat_dim": 100,  # num of mel bank
-            "env_info": get_env_info(),
-            "pad_id": 0,
-        }
+    filename = params.exp_dir / f"epoch-{params.start_epoch-1}.pt"
+
+    assert filename.is_file(), f"{filename} does not exist!"
+
+    saved_params = load_checkpoint(
+        filename, model=model, model_avg=model_avg, model_ema=model_ema, strict=True
     )
 
-    return params
+    if params.start_epoch > 1:
+        keys = [
+            "best_train_epoch",
+            "best_valid_epoch",
+            "batch_idx_train",
+            "best_train_loss",
+            "best_valid_loss",
+        ]
+        for k in keys:
+            params[k] = saved_params[k]
+
+    return saved_params
 
 
 def compute_fbank_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
+    teacher_model: Union[nn.Module, DDP],
+    target_model: Union[nn.Module, DDP],
     features: Tensor,
     features_lens: Tensor,
     token_ids: List[List[int]],
@@ -522,12 +328,18 @@ def compute_fbank_loss(
         Parameters for training. See :func:`get_params`.
       model:
         The model for training.
+      teacher_model:
+        The teacher model for distillation.
+      target_model:
+       The EMA target model.
       features:
         The target acoustic feature.
       features_lens:
         The number of frames of each utterance.
       token_ids:
-        Input token ids that representing the transcripts.
+        Input tokens that representing the transcripts.
+      durations:
+        Duration of each token.
       is_training:
         True for training. False for validation. When it is True, this
         function enables autograd during computation; when it is False, it
@@ -543,38 +355,94 @@ def compute_fbank_loss(
     )  # (B, T, F)
     noise = torch.randn_like(features)  # (B, T, F)
 
-    # Sampling t from uniform distribution
-    if is_training:
-        t = torch.rand(batch_size, 1, 1, device=device)
-    else:
-        t = (
-            (torch.arange(batch_size, device=device) / batch_size)
-            .unsqueeze(1)
-            .unsqueeze(2)
-        )
-    with torch.set_grad_enabled(is_training):
+    # Sampling t and guidance_scale from uniform distribution
 
-        loss = model(
+    t_value = random.random()
+    t = torch.ones(batch_size, 1, 1, device=device) * t_value
+    guidance_scale = (
+        torch.rand(batch_size, 1, 1, device=device) * params.max_guidance_scale
+    )
+    xt = features * t + noise * (1 - t)
+    t_delta_fix = random.uniform(0.0, min(0.3, 1 - t_value))
+    t_delta_ema = random.uniform(0.0, min(0.7, 1 - t_value - t_delta_fix))
+    t_dest = t + t_delta_fix + t_delta_ema
+    num_step = 1
+
+    with torch.no_grad():
+        audio_condition_mask = condition_time_mask(
+            features_lens=features_lens,
+            mask_percent=(0.7, 1.0),
+            max_len=features.size(1),
+        )
+
+        teacher_x_t_mid, _ = teacher_model.sample_intermediate(
             tokens=token_ids,
             features=features,
             features_lens=features_lens,
-            noise=noise,
-            t=t,
-            condition_drop_ratio=params.condition_drop_ratio,
+            noise=xt,
+            audio_condition_mask=audio_condition_mask,
+            t_start=t,
+            t_end=t + t_delta_fix,
+            solver="euler",
+            num_step=num_step,
+            guidance_scale=guidance_scale,
         )
+
+        target_x1, _ = target_model(
+            tokens=token_ids,
+            features=features,
+            features_lens=features_lens,
+            noise=teacher_x_t_mid,
+            audio_condition_mask=audio_condition_mask,
+            t_start=t + t_delta_fix,
+            t_end=t_dest,
+            solver="euler",
+            num_step=1,
+            guidance_scale=guidance_scale,
+            distill=True,
+        )
+
+    with torch.set_grad_enabled(is_training):
+
+        pred_x1, _ = model(
+            tokens=token_ids,
+            features=features,
+            features_lens=features_lens,
+            noise=xt,
+            audio_condition_mask=audio_condition_mask,
+            t_start=t,
+            t_end=t_dest,
+            solver="euler",
+            num_step=1,
+            guidance_scale=guidance_scale,
+            distill=True,
+        )
+        pred_v = (pred_x1 - xt) / (t_dest - t)
+
+        padding_mask = make_pad_mask(features_lens, max_len=num_frames)  # (B, T)
+        loss_mask = audio_condition_mask & (~padding_mask)
+
+        target_v = (target_x1 - xt) / (t_dest - t)
+        loss = torch.mean((pred_v[loss_mask] - target_v[loss_mask]) ** 2)
+
+        ut = features - noise  # (B, T, F)
+
+        ref_loss = torch.mean((pred_v[loss_mask] - ut[loss_mask]) ** 2)
 
     assert loss.requires_grad == is_training
     info = MetricsTracker()
     num_frames = features_lens.sum().item()
     info["frames"] = num_frames
     info["loss"] = loss.detach().cpu().item() * num_frames
-
+    info["ref_loss"] = ref_loss.detach().cpu().item() * num_frames
     return loss, info
 
 
 def train_one_epoch(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
+    teacher_model: Union[nn.Module, DDP],
+    target_model: Union[nn.Module, DDP],
     optimizer: Optimizer,
     scheduler: LRSchedulerType,
     train_dl: torch.utils.data.DataLoader,
@@ -596,6 +464,10 @@ def train_one_epoch(
         It is returned by :func:`get_params`.
       model:
         The model for training.
+      teacher_model:
+        The model for distillation.
+      target_model:
+        The ema target model.
       optimizer:
         The optimizer.
       scheduler:
@@ -627,6 +499,7 @@ def train_one_epoch(
             filename=params.exp_dir / f"bad-model{suffix}-{rank}.pt",
             model=model,
             model_avg=model_avg,
+            model_ema=target_model,
             params=params,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -638,7 +511,7 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(train_dl):
 
         if batch_idx % 10 == 0:
-            set_batch_count(model, get_adjusted_batch_count(params))
+            set_batch_count(model, get_adjusted_batch_count(params) + 100000)
 
         if (
             params.valid_interval is None
@@ -653,6 +526,8 @@ def train_one_epoch(
             valid_info = compute_validation_loss(
                 params=params,
                 model=model,
+                teacher_model=teacher_model,
+                target_model=target_model,
                 valid_dl=valid_dl,
                 world_size=world_size,
             )
@@ -694,6 +569,8 @@ def train_one_epoch(
                 loss, loss_info = compute_fbank_loss(
                     params=params,
                     model=model,
+                    teacher_model=teacher_model,
+                    target_model=target_model,
                     features=inputs["features"],
                     features_lens=inputs["features_lens"],
                     token_ids=inputs["token_ids"],
@@ -705,17 +582,10 @@ def train_one_epoch(
             scaler.scale(loss).backward()
 
             scheduler.step_batch(params.batch_idx_train)
-            # Use the number of hours of speech to adjust the learning rate
-            if params.lr_hours > 0:
-                scheduler.step_epoch(
-                    params.batch_idx_train
-                    * params.max_duration
-                    * params.world_size
-                    / 3600
-                )
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+            ema(model, target_model, params.ema_decay)
         except Exception as e:
             logging.info(f"Caught exception : {e}.")
             save_bad_model()
@@ -812,6 +682,8 @@ def train_one_epoch(
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
+    teacher_model: Optional[nn.Module],
+    target_model: Optional[nn.Module],
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
 ) -> MetricsTracker:
@@ -846,6 +718,8 @@ def compute_validation_loss(
         loss, loss_info = compute_fbank_loss(
             params=params,
             model=model,
+            teacher_model=teacher_model,
+            target_model=target_model,
             features=inputs["features"],
             features_lens=inputs["features_lens"],
             token_ids=inputs["token_ids"],
@@ -865,41 +739,6 @@ def compute_validation_loss(
     return tot_loss
 
 
-def tokenize_text(c: Cut):
-    # SpeechSynthesisDataset needs normalized_text, see tts_datamodule for details
-    if hasattr(c.supervisions[0], "normalized_text"):
-        text = c.supervisions[0].normalized_text
-    else:
-        c.supervisions[0].normalized_text = c.supervisions[0].text
-        text = c.supervisions[0].text
-    token_ids, tokens = tokenizer.texts_to_token_ids([text], return_tokens=True)
-    # return raw tokens as well for debug purpose
-    c.supervisions[0].token_ids = token_ids[0]
-    c.supervisions[0].tokens = tokens[0]
-
-    # tokenize text in prompt
-    if hasattr(c, "prompt"):
-        if hasattr(c.prompt.supervisions[0], "normalized_text"):
-            text = c.prompt.supervisions[0].normalized_text
-        else:
-            c.prompt.supervisions[0].normalized_text = c.prompt.supervisions[0].text
-            text = c.prompt.supervisions[0].text
-        token_ids, tokens = tokenizer.texts_to_token_ids([text], return_tokens=True)
-        c.prompt.supervisions[0].token_ids = token_ids[0]
-        c.prompt.supervisions[0].tokens = tokens[0]
-    return c
-
-
-def remove_short_and_long_utt(c: Cut):
-    # Keep only utterances with duration between 1 second and 20 seconds
-    # You should use ../local/display_manifest_statistics.py to get
-    # an utterance duration distribution for your dataset to select
-    # the threshold
-    if c.duration < 1.0 or c.duration > 20.0:
-        return False
-    return True
-
-
 def run(rank, world_size, args):
     """
     Args:
@@ -914,24 +753,6 @@ def run(rank, world_size, args):
     """
     params = get_params()
     params.update(vars(args))
-
-    assert (
-        params.sampling_rate == params.sample_rate
-    ), f"""sample_rate must be equal to sampling_rate of feature extractor,
-    got {params.sample_rate} and {params.sampling_rate}."""
-
-    assert (
-        params.feat_dim == params.n_mels
-    ), f"""feat_dim must be equal to
-    n_mels of feature extractor, got {params.feat_dim} and {params.n_mels}."""
-
-    assert (
-        params.frame_shift_ms == params.frame_shift / params.sampling_rate * 1000
-    ), f"""
-    frame_shift_ms must be equal to frame_shift / sampling_rate * 1000,
-    got {params.frame_shift_ms} and {params.frame_shift / params.sampling_rate * 1000}."""
-
-    assert params.return_tokens, f"params.return_tokens should be True."
 
     fix_random_seed(params.seed)
     if world_size > 1:
@@ -960,10 +781,16 @@ def run(rank, world_size, args):
 
     logging.info("About to create model")
 
-    model = get_model(params)
-    if params.checkpoint is not None:
-        logging.info(f"Loading pre-trained model from {params.checkpoint}")
-        _ = load_checkpoint(filename=params.checkpoint, model=model, strict=True)
+    teacher_model = get_model(params)
+    assert params.teacher_model is not None
+    logging.info(f"Loading pre-trained model from {params.teacher_model}")
+    _ = load_checkpoint(filename=params.teacher_model, model=teacher_model, strict=True)
+
+    model = get_distill_model(params)
+    _ = load_checkpoint(filename=params.teacher_model, model=model, strict=False)
+
+    target_model = copy.deepcopy(model)
+
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of parameters : {num_param}")
 
@@ -971,13 +798,37 @@ def run(rank, world_size, args):
     if rank == 0:
         # model_avg is only used with rank 0
         model_avg = copy.deepcopy(model).to(torch.float64)
-
-    checkpoints = resume_checkpoint(params=params, model=model, model_avg=model_avg)
+    assert params.start_epoch > 0, params.start_epoch
+    if params.start_epoch > 1:
+        logging.info(f"Resuming from epoch {params.start_epoch}")
+        checkpoints = resume_checkpoint(
+            params=params, model=model, model_avg=model_avg, model_ema=target_model
+        )
 
     model = model.to(device)
+    teacher_model.to(device)
+    target_model.to(device)
+    teacher_model.eval()
+    target_model.eval()
+
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+
+    # only update the audio encoder and condition encoder
+    num_trainable = 0
+    for name, p in model.named_parameters():
+        if "fm_decoder" in name:
+            p.requires_grad = True
+            num_trainable += p.numel()
+        else:
+            p.requires_grad = False
+
+    logging.info(
+        "A total of {} trainable parameters ({:.3f}% of the whole model)".format(
+            num_trainable, num_trainable / num_param * 100
+        )
+    )
 
     optimizer = ScaledAdam(
         get_parameter_groups_with_lrs(
@@ -989,15 +840,11 @@ def run(rank, world_size, args):
         clipping_scale=2.0,
     )
 
-    assert params.lr_hours >= 0
-    if params.lr_hours > 0:
-        scheduler = Eden(optimizer, params.lr_batches, params.lr_hours)
-    else:
-        scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
+    scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs, warmup_batches=1)
 
     scaler = GradScaler(enabled=params.use_fp16, init_scale=1024.0)
 
-    if checkpoints is not None:
+    if params.start_epoch > 1 and checkpoints is not None:
         # load state_dict for optimizers
         if "optimizer" in checkpoints:
             logging.info("Loading optimizer state dict")
@@ -1021,35 +868,26 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
-    libritts = TtsDataModule(args)
+    libritts = LibrittsTtsDataModule(args)
 
     if params.full_libri:
         train_cuts = libritts.train_all_shuf_cuts()
     else:
         train_cuts = libritts.train_clean_460_cuts()
 
-    if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
-        # We only load the sampler's state dict when it loads a checkpoint
-        # saved in the middle of an epoch
-        sampler_state_dict = checkpoints["sampler"]
-    else:
-        sampler_state_dict = None
-
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
     train_cuts = train_cuts.map(tokenize_text)
-    train_dl = libritts.train_dataloaders(
-        train_cuts, sampler_state_dict=sampler_state_dict
-    )
+    train_dl = libritts.train_dataloaders(train_cuts)
 
     dev_clean_cuts = libritts.dev_clean_cuts()
+    dev_clean_cuts = dev_clean_cuts.filter(remove_short_and_long_utt)
     dev_clean_cuts = dev_clean_cuts.map(tokenize_text)
     valid_dl = libritts.dev_dataloaders(dev_clean_cuts)
 
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         logging.info(f"Start epoch {epoch}")
 
-        if params.lr_hours == 0:
-            scheduler.step_epoch(epoch - 1)
+        scheduler.step_epoch(epoch - 1)
         fix_random_seed(params.seed + epoch - 1)
         train_dl.sampler.set_epoch(epoch - 1)
 
@@ -1062,6 +900,9 @@ def run(rank, world_size, args):
             params=params,
             model=model,
             model_avg=model_avg,
+            teacher_model=teacher_model,
+            target_model=target_model,
+            tokenizer=tokenizer,
             optimizer=optimizer,
             scheduler=scheduler,
             train_dl=train_dl,
@@ -1082,6 +923,7 @@ def run(rank, world_size, args):
             params=params,
             model=model,
             model_avg=model_avg,
+            model_ema=target_model,
             optimizer=optimizer,
             scheduler=scheduler,
             sampler=train_dl.sampler,
@@ -1107,7 +949,7 @@ def run(rank, world_size, args):
 
 def main():
     parser = get_parser()
-    TtsDataModule.add_arguments(parser)
+    LibrittsTtsDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
 

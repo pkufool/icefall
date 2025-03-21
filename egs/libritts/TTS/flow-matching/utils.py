@@ -27,7 +27,6 @@ def prepare_input(
     params: AttributeDict,
     batch: dict,
     device: torch.device,
-    tokenizer: Optional[Tokenizer] = None,
     return_token_ids: bool = True,
     return_feature: bool = True,
     return_audio: bool = False,
@@ -57,8 +56,6 @@ def prepare_input(
         for the format of the `batch`.
       device:
         The device of the returned Tensors.
-      tokenizer:
-        The tokenizer used to convert text to token ids.
       return_tokens:
         If True, return token ids.
       return_feature:
@@ -71,14 +68,7 @@ def prepare_input(
     return_dict = {}
 
     if return_token_ids:
-        assert tokenizer is not None
-
-        if params.token_type == "phone":
-            tokens = tokenizer.tokens_to_token_ids(batch["tokens"])
-        else:
-            tokens = tokenizer.texts_to_token_ids(batch["text"])
-
-        return_dict["token_ids"] = tokens
+        return_dict["token_ids"] = batch["token_ids"]
 
     if return_feature:
         features = batch["features"].to(device)
@@ -93,11 +83,7 @@ def prepare_input(
     if return_prompt:
         return_dict["prompt"] = {}
         if return_token_ids:
-            if params.token_type == "phone":
-                prompt_tokens = tokenizer.tokens_to_token_ids(batch["prompt"]["tokens"])
-            else:
-                prompt_tokens = tokenizer.texts_to_token_ids(batch["prompt"]["text"])
-            return_dict["prompt"]["token_ids"] = prompt_tokens
+            return_dict["prompt"]["token_ids"] = batch["prompt"]["token_ids"]
         if return_feature:
             prompt_features = batch["prompt"]["features"].to(device)
             prompt_features_lens = batch["prompt"]["features_lens"].to(device)
@@ -108,7 +94,6 @@ def prepare_input(
             return_dict["prompt"]["audio_lens"] = batch["prompt"]["audio_lens"].to(
                 device
             )
-
     return return_dict
 
 

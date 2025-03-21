@@ -3,11 +3,17 @@
 # fix segmentation fault reported in https://github.com/k2-fsa/icefall/issues/674
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
+# add icefall to PYTHONPATH
+export PYTHONPATH=../../../:$PYTHONPATH
+
 set -eou pipefail
 
 stage=0
 stop_stage=100
-sampling_rate=24000
+
+token_type=bpe  # bpe, letter, phone
+bpe_vocab_size=500
+
 nj=32
 
 dl_dir=$PWD/download
@@ -25,6 +31,20 @@ log() {
 }
 
 log "dl_dir: $dl_dir"
+
+
+if [ $stage -le -2 ] && [ $stop_stage -ge -2 ]; then
+
+  if [ ! -d $dl_dir/xvector_nnet_1a_libritts_clean_460 ]; then
+    log "Downloading x-vector"
+
+    git clone https://huggingface.co/datasets/zrjin/xvector_nnet_1a_libritts_clean_460 $dl_dir/xvector_nnet_1a_libritts_clean_460
+
+    mkdir -p exp/xvector_nnet_1a/
+    cp -r $dl_dir/xvector_nnet_1a_libritts_clean_460/* exp/xvector_nnet_1a/
+  fi
+
+fi
 
 if [ $stage -le -1 ] && [ $stop_stage -ge -1 ]; then
   log "Stage -1: build monotonic_align lib"
@@ -49,15 +69,6 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
     lhotse download libritts $dl_dir
   fi
 
-  if [ ! -d $dl_dir/xvector_nnet_1a_libritts_clean_460 ]; then
-    log "Downloading x-vector"
-
-    git clone https://huggingface.co/datasets/zrjin/xvector_nnet_1a_libritts_clean_460 $dl_dir/xvector_nnet_1a_libritts_clean_460
-
-    mkdir -p exp/xvector_nnet_1a/
-    cp -r $dl_dir/xvector_nnet_1a_libritts_clean_460/* exp/xvector_nnet_1a/
-  fi
-
 fi
 
 if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
@@ -72,7 +83,121 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
 fi
 
 if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
-  log "Stage 2: Compute Spectrogram for LibriTTS"
+  log "Stage 2: Compute Fbank for LibriTTS"
+  mkdir -p data/fbank
+
+  for subset in train-clean-100 train-clean-360 train-other-500 dev-clean test-clean; do
+    python local/compute_fbank.py --dataset libritts --subset ${subset}
+  done
+
+  # Here we shuffle and combine the train-clean-100, train-clean-360 and
+  # train-other-500 together to form the training set.
+  if [ ! -f data/fbank/libritts_cuts_train-all-shuf.jsonl.gz ]; then
+    cat <(gunzip -c data/fbank/libritts_cuts_train-clean-100.jsonl.gz) \
+      <(gunzip -c data/fbank/libritts_cuts_train-clean-360.jsonl.gz) \
+      <(gunzip -c data/fbank/libritts_cuts_train-other-500.jsonl.gz) | \
+      shuf | gzip -c > data/fbank/libritts_cuts_train-all-shuf.jsonl.gz
+  fi
+
+  if [ ! -f data/fbank/libritts_cuts_train-clean-460.jsonl.gz ]; then
+    cat <(gunzip -c data/fbank/libritts_cuts_train-clean-100.jsonl.gz) \
+      <(gunzip -c data/fbank/libritts_cuts_train-clean-360.jsonl.gz) | \
+      shuf | gzip -c > data/fbank/libritts_cuts_train-clean-460.jsonl.gz
+  fi
+
+  if [ ! -e data/fbank/.libritts-validated.done ]; then
+    log "Validating data/fbank for LibriTTS"
+    ./local/validate_manifest.py \
+      data/fbank/libritts_cuts_train-all-shuf.jsonl.gz
+    touch data/fbank/.libritts-validated.done
+  fi
+fi
+
+if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
+  log "Stage 3: Prepare tokens.txt"
+
+  if [ $token_type == "bpe" ] || [ $token_type == "letter" ]; then
+    if [ ! -e data/texts.txt ]; then
+      ./local/export_normalized_texts.py --output data/texts.txt \
+        --manifests data/fbank/libritts_cuts_train-all-shuf.jsonl.gz
+    fi
+  fi
+
+  if [ $token_type == "bpe" ]; then
+    mkdir -p data/lang_bpe_${bpe_vocab_size}
+    if [ ! -e data/lang_bpe_${bpe_vocab_size}/tokens.txt ]; then
+      ./local/train_bpe_model.py --transcript data/texts.txt \
+        --lang-dir data/lang_bpe_${bpe_vocab_size} \
+        --vocab-size $bpe_vocab_size
+    fi
+  fi
+
+  if [ $token_type == "phone" ]; then
+    mkdir -p data/lang_phone
+    ./local/export_tokens.py --token-type phone \
+      --output data/lang_phone/tokens.txt
+  fi
+
+  if [ $token_type == "letter" ]; then
+    mkdir -p data/lang_letter
+    ./local/export_tokens.py --token-type letter  \
+      --texts data/texts.txt \
+      --output data/lang_letter/tokens.txt
+  fi
+fi
+
+if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
+  log "Stage 4: Download and prepare librispeech-pc test clean for testing."
+
+  if [ ! -e $dl_dir/test-clean.tar.gz ]; then
+    wget https://huggingface.co/datasets/k2-fsa/LibriSpeech/resolve/main/test-clean.tar.gz -P $dl_dir
+  fi
+  # For China users.
+  if [ ! -e $dl_dir/test-clean.tar.gz ]; then
+    wget https://hf-mirror.com/datasets/k2-fsa/LibriSpeech/resolve/main/test-clean.tar.gz -P $dl_dir
+  fi
+
+  if [ ! -d $dl_dir/LibriSpeech/test-clean ]; then
+    tar -xvf $dl_dir/test-clean.tar.gz -C $dl_dir
+  fi
+
+  mkdir -p $dl_dir/LibriSpeech-PC
+  if [ ! -e $dl_dir/LibriSpeech-PC/test-clean.json ]; then
+    wget https://us.openslr.org/resources/145/manifests.tar.gz -P $dl_dir/LibriSpeech-PC
+    tar -xvf $dl_dir/LibriSpeech-PC/manifests.tar.gz -C $dl_dir/LibriSpeech-PC
+  fi
+
+  python local/compute_fbank.py --dataset librispeech --subset test-clean
+  python local/prepare_prompts_librispeech_test_clean.py
+fi
+
+if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
+  log "Stage 5: Download pretrained models for evaluation."
+
+  if [ ! -e $dl_dir/test-clean.tar.gz ]; then
+    wget https://huggingface.co/datasets/k2-fsa/LibriSpeech/resolve/main/test-clean.tar.gz -P $dl_dir
+  fi
+  # For China users.
+  if [ ! -e $dl_dir/test-clean.tar.gz ]; then
+    wget https://hf-mirror.com/datasets/k2-fsa/LibriSpeech/resolve/main/test-clean.tar.gz -P $dl_dir
+  fi
+
+  if [ ! -d $dl_dir/LibriSpeech/test-clean ]; then
+    tar -xvf $dl_dir/test-clean.tar.gz -C $dl_dir
+  fi
+
+  mkdir -p $dl_dir/LibriSpeech-PC
+  if [ ! -e $dl_dir/LibriSpeech-PC/test-clean.json ]; then
+    wget https://us.openslr.org/resources/145/manifests.tar.gz -P $dl_dir/LibriSpeech-PC
+    tar -xvf $dl_dir/LibriSpeech-PC/manifests.tar.gz -C $dl_dir/LibriSpeech-PC
+  fi
+
+  python local/compute_fbank.py --dataset librispeech --subset test-clean
+  python local/prepare_prompts_librispeech_test_clean.py
+fi
+
+if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
+  log "Stage 5: Compute Spectrogram for LibriTTS (for VITS system)"
   mkdir -p data/spectrogram
   if [ ! -e data/spectrogram/.libritts.done ]; then
     ./local/compute_spectrogram_libritts.py --sampling-rate $sampling_rate
@@ -104,39 +229,10 @@ if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
   fi
 fi
 
-if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
-  log "Stage 3: Prepare phoneme tokens for LibriTTS"
-  # We assume you have installed piper_phonemize and espnet_tts_frontend.
-  # If not, please install them with:
-  #   - piper_phonemize:
-  #       refer to https://github.com/rhasspy/piper-phonemize,
-  #       could install the pre-built wheels from https://github.com/csukuangfj/piper-phonemize/releases/tag/2023.12.5
-  #   - espnet_tts_frontend:
-  #       `pip install espnet_tts_frontend`, refer to https://github.com/espnet/espnet_tts_frontend/
-  if [ ! -e data/spectrogram/.libritts_with_token.done ]; then
-    ./local/prepare_tokens_libritts.py
-    touch data/spectrogram/.libritts_with_token.done
-  fi
-fi
-
-if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
-  log "Stage 4: Generate token file"
-  # We assume you have installed piper_phonemize and espnet_tts_frontend.
-  # If not, please install them with:
-  #   - piper_phonemize:
-  #       refer to https://github.com/rhasspy/piper-phonemize,
-  #       could install the pre-built wheels from https://github.com/csukuangfj/piper-phonemize/releases/tag/2023.12.5
-  #   - espnet_tts_frontend:
-  #       `pip install espnet_tts_frontend`, refer to https://github.com/espnet/espnet_tts_frontend/
-  if [ ! -e data/tokens.txt ]; then
-    ./local/prepare_token_file.py --tokens data/tokens.txt
-  fi
-fi
-
 audio_feats_dir=data/tokenized
 dataset_parts="--dataset-parts all"  # debug "-p dev-clean -p test-clean"
-if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
-  log "Stage 5: Tokenize/Fbank LibriTTS for valle"
+if [ $stage -le 6 ] && [ $stop_stage -ge 6 ]; then
+  log "Stage 6: Tokenize/Fbank LibriTTS for valle"
   mkdir -p ${audio_feats_dir}
   if [ ! -e ${audio_feats_dir}/.libritts.tokenize.done ]; then
     python3 ./local/compute_neural_codec_and_prepare_text_tokens.py --dataset-parts "${dataset_parts}" \
