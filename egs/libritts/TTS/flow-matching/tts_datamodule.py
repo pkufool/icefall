@@ -37,12 +37,14 @@ from lhotse.dataset import (  # noqa F401 for PrecomputedFeatures
     DynamicBucketingSampler,
     PrecomputedFeatures,
     SimpleCutSampler,
+    make_worker_init_fn,
 )
 from lhotse.dataset.collation import collate_audio
 from lhotse.dataset.input_strategies import (
     BatchIO,
     OnTheFlyFeatures,
 )
+from lhotse.dataset.iterable_dataset import IterableDatasetWrapper
 from lhotse.dataset.sampling.base import TimeConstraint
 from lhotse.features.base import FeatureExtractor, register_extractor
 from lhotse.utils import Seconds, compute_num_frames, fix_random_seed, ifnone
@@ -131,6 +133,8 @@ class TorchAudioFbank(FeatureExtractor):
             f"got {sampling_rate}"
         )
         samples = torch.from_numpy(samples)
+        if samples.ndim == 1:
+            samples = samples.unsqueeze(0)
         assert samples.ndim == 2, samples.shape
         assert samples.shape[0] == 1, samples.shape
 
@@ -522,6 +526,76 @@ class TtsDataModule:
             num_workers=self.args.num_workers,
             persistent_workers=False,
             worker_init_fn=worker_init_fn,
+        )
+        return train_dl
+
+    def train_shar_dataloaders(
+        self,
+        cuts_train: CutSet,
+        sampler_state_dict: Optional[Dict[str, Any]] = None,
+    ) -> DataLoader:
+        """
+        Args:
+          cuts_train:
+            CutSet for training.
+          sampler_state_dict:
+            The state dict for the training sampler.
+        """
+        logging.info("About to create train dataset")
+        train = SpeechSynthesisDataset(
+            return_text=self.args.return_text,
+            return_tokens=self.args.return_tokens,
+            return_spk_ids=self.args.return_spk_ids,
+            feature_input_strategy=eval(self.args.input_strategy)(),
+            return_cuts=self.args.return_cuts,
+            return_audio=self.args.return_audio,
+        )
+
+        if self.args.on_the_fly_feats:
+            config = TorchAudioFbankConfig(
+                sampling_rate=self.args.sampling_rate,
+                n_mels=self.args.n_mels,
+                n_fft=self.args.frame_length,
+                hop_length=self.args.frame_shift,
+            )
+            train = SpeechSynthesisDataset(
+                return_text=self.args.return_text,
+                return_tokens=self.args.return_tokens,
+                return_spk_ids=self.args.return_spk_ids,
+                feature_input_strategy=OnTheFlyFeatures(TorchAudioFbank(config)),
+                return_cuts=self.args.return_cuts,
+                return_audio=self.args.return_audio,
+            )
+
+        logging.info("Using DynamicBucketingSampler.")
+        train_sampler = DynamicBucketingSampler(
+            cuts_train,
+            max_duration=self.args.max_duration,
+            shuffle=self.args.shuffle,
+            num_buckets=self.args.num_buckets,
+            buffer_size=self.args.num_buckets * 2000,
+            shuffle_buffer_size=self.args.num_buckets * 5000,
+            rank=0,
+            world_size=1,
+        )
+
+        logging.info("About to create train dataloader")
+
+        if sampler_state_dict is not None:
+            logging.info("Loading sampler state dict")
+            train_sampler.load_state_dict(sampler_state_dict)
+
+        train_iter_dataset = IterableDatasetWrapper(
+            dataset=train,
+            sampler=train_sampler,
+        )
+
+        train_dl = DataLoader(
+            train_iter_dataset,
+            batch_size=None,
+            num_workers=self.args.num_workers,
+            persistent_workers=False,
+            worker_init_fn=make_worker_init_fn(seed=0),
         )
 
         return train_dl
