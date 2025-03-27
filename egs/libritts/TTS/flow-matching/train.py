@@ -20,6 +20,7 @@ import argparse
 import copy
 import logging
 import os
+from functools import partial
 from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -865,7 +866,7 @@ def compute_validation_loss(
     return tot_loss
 
 
-def tokenize_text(c: Cut):
+def tokenize_text(c: Cut, tokenizer):
     # SpeechSynthesisDataset needs normalized_text, see tts_datamodule for details
     if hasattr(c.supervisions[0], "normalized_text"):
         text = c.supervisions[0].normalized_text
@@ -1035,14 +1036,16 @@ def run(rank, world_size, args):
     else:
         sampler_state_dict = None
 
+    _tokenize_text = partial(tokenize_text, tokenizer=tokenizer)
+
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
-    train_cuts = train_cuts.map(tokenize_text)
+    train_cuts = train_cuts.map(_tokenize_text)
     train_dl = libritts.train_dataloaders(
         train_cuts, sampler_state_dict=sampler_state_dict
     )
 
     dev_clean_cuts = libritts.dev_clean_cuts()
-    dev_clean_cuts = dev_clean_cuts.map(tokenize_text)
+    dev_clean_cuts = dev_clean_cuts.map(_tokenize_text)
     valid_dl = libritts.dev_dataloaders(dev_clean_cuts)
 
     for epoch in range(params.start_epoch, params.num_epochs + 1):

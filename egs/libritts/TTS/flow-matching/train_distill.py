@@ -21,6 +21,7 @@ import copy
 import logging
 import os
 import random
+from functools import partial
 from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -875,13 +876,15 @@ def run(rank, world_size, args):
     else:
         train_cuts = libritts.train_clean_460_cuts()
 
+    _tokenize_text = partial(tokenize_text, tokenizer=tokenizer)
+
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
-    train_cuts = train_cuts.map(tokenize_text)
+    train_cuts = train_cuts.map(_tokenize_text)
     train_dl = libritts.train_dataloaders(train_cuts)
 
     dev_clean_cuts = libritts.dev_clean_cuts()
     dev_clean_cuts = dev_clean_cuts.filter(remove_short_and_long_utt)
-    dev_clean_cuts = dev_clean_cuts.map(tokenize_text)
+    dev_clean_cuts = dev_clean_cuts.map(_tokenize_text)
     valid_dl = libritts.dev_dataloaders(dev_clean_cuts)
 
     for epoch in range(params.start_epoch, params.num_epochs + 1):
