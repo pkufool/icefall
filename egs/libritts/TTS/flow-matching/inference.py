@@ -30,7 +30,7 @@ from model import get_distill_model, get_model
 from scipy.io.wavfile import write
 from tokenizer import Tokenizer
 from train import add_model_arguments, get_params
-from tts_datamodule import TtsDataModule
+from tts_datamodule import TorchAudioFbank, TorchAudioFbankConfig, TtsDataModule
 from utils import prepare_input, save_plot
 from vocos import Vocos
 
@@ -154,6 +154,15 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--text-with-prompt",
+        type=str,
+        help="""
+        The input file with the following format:
+        target_audio_name \t prompt_text \t prompt_audio_path \t text
+        """,
+    )
+
+    parser.add_argument(
         "--vocoder-only",
         type=str2bool,
         default=False,
@@ -186,22 +195,20 @@ def get_vocoder(vocos_local_path: str):
 def decode_texts(
     params: AttributeDict, model: nn.Module, vocoder: nn.Module, tokenizer: Tokenizer
 ):
+    """
+    Run inference on the given prompt and text pairs.
+    """
     total_rtf = []
     total_rtf_no_vocoder = []
     total_rtf_vocoder = []
-    total_t_dict = {
-        "forward_text_t": [],
-        "forward_feature_t": [],
-    }
 
-    sampling_rate = 24000
-    config = FbankConfig(
-        sampling_rate=sampling_rate,
-        frame_length=1024 / sampling_rate,  # (in second),
-        frame_shift=256 / sampling_rate,  # (in second)
-        use_fft_mag=True,
+    config = TorchAudioFbankConfig(
+        sampling_rate=params.sampling_rate,
+        n_mels=params.n_mels,
+        n_fft=params.frame_length,
+        hop_length=params.frame_shift,
     )
-    feature_extractor = Fbank(config)
+    feature_extractor = TorchAudioFbank(config)
     device = params.device
 
     with open(params.text_with_prompt, "r") as fr:
@@ -212,6 +219,10 @@ def decode_texts(
             tokens = tokenizer.texts_to_token_ids([text])
             prompt_tokens = tokenizer.texts_to_token_ids([prompt_text])
             prompt_audio, sampling_rate = torchaudio.load(prompt_audio)
+            assert sampling_rate == params.sampling_rate, (
+                sampling_rate,
+                params.sampling_rate,
+            )
             prompt_features = feature_extractor.extract(
                 prompt_audio, sampling_rate=sampling_rate
             ).to(device)
@@ -219,21 +230,30 @@ def decode_texts(
                 [prompt_features.size(1)], device=device
             )
             start_t = dt.datetime.now()
-            x1, x1_lens, t_dict = model.sample(
+
+            (
+                pred_features,
+                pred_features_lens,
+                pred_prompt_features,
+                pred_prompt_features_lens,
+            ) = model.sample(
                 tokens=tokens,
-                use_prompt=True,
+                prompt_tokens=prompt_tokens,
                 prompt_features=prompt_features,
                 prompt_features_lens=prompt_features_lens,
+                duration=params.duration,
                 solver=params.solver,
                 num_step=params.num_step,
-                cfg_scale=params.cfg_scale,
-                consistency=params.consistency,
+                guidance_scale=params.guidance_scale,
+                distill=params.distill,
             )
 
-            gen_fbank = x1.permute(0, 2, 1) / params.feat_scale  # (B, C, T)
+            pred_features = (
+                pred_features.permute(0, 2, 1) / params.feat_scale
+            )  # (B, C, T)
 
             start_vocoder_t = dt.datetime.now()
-            audios = vocoder.forward(gen_fbank).squeeze(1).clamp(-1, 1)
+            audios = vocoder.forward(prompt_features).squeeze(1).clamp(-1, 1)
 
             t = (dt.datetime.now() - start_t).total_seconds()
             t_no_vocoder = (start_vocoder_t - start_t).total_seconds()
@@ -242,10 +262,6 @@ def decode_texts(
             audio = audios[0][
                 : int(x1_lens[0] * params.frame_shift_ms / 1000 * params.sample_rate)
             ]
-            for key in total_t_dict.keys():
-                total_t_dict[key].append(
-                    t_dict[key] * params.sample_rate / (audio.shape[-1])
-                )
 
             rtf = t * params.sample_rate / (audio.shape[-1])
             rtf_no_vocoder = t_no_vocoder * params.sample_rate / (audio.shape[-1])
@@ -265,8 +281,6 @@ def decode_texts(
     print(f"Average RTF: {np.mean(total_rtf[10:]):.4f}")
     print(f"Average RTF w/o vocoder: {np.mean(total_rtf_no_vocoder[10:]):.4f}")
     print(f"Average RTF vocoder: {np.mean(total_rtf_vocoder[10:]):.4f}")
-    for key in total_t_dict.keys():
-        print(f"Average RTF {key}: {np.mean(total_t_dict[key][10:]):.4f}")
 
 
 def decode_one_batch(
@@ -483,6 +497,7 @@ def main():
     device = torch.device("cpu")
     if torch.cuda.is_available():
         device = torch.device("cuda", 0)
+    params.device = device
 
     logging.info(f"Device: {device}")
 
