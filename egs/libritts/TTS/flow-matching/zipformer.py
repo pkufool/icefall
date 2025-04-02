@@ -114,12 +114,12 @@ class TTSZipformer(nn.Module):
         downsampling_factor: Tuple[int] = (2, 4),
         num_encoder_layers: Union[int, Tuple[int]] = 4,
         cnn_module_kernel: Union[int, Tuple[int]] = 31,
-        encoder_dim: int = 384,
+        encoder_dim: Union[int, Tuple[int]] = 384,
         query_head_dim: int = 24,
         pos_head_dim: int = 4,
         value_head_dim: int = 12,
         num_heads: int = 8,
-        feedforward_dim: int = 1536,
+        feedforward_dim: Union[int, Tuple[int]] = 1536,
         pos_dim: int = 192,
         dropout: FloatLike = None,  # see code below for default
         warmup_batches: float = 4000.0,
@@ -142,7 +142,7 @@ class TTSZipformer(nn.Module):
             if len(x) == 1:
                 x = x * len(downsampling_factor)
             else:
-                assert len(x) == len(downsampling_factor) and isinstance(x[0], int)
+                assert len(x) == len(downsampling_factor) and isinstance(x[0], int), x
             return x
 
         def _assert_downsampling_factor(factors):
@@ -159,7 +159,10 @@ class TTSZipformer(nn.Module):
         self.downsampling_factor = downsampling_factor  # tuple
         num_encoder_layers = _to_tuple(num_encoder_layers)
         self.cnn_module_kernel = cnn_module_kernel = _to_tuple(cnn_module_kernel)
+        encoder_dim = _to_tuple(encoder_dim)
         self.encoder_dim = encoder_dim
+        feedforward_dim = _to_tuple(feedforward_dim)
+        self.feedforward_dim = feedforward_dim
         self.num_encoder_layers = num_encoder_layers
         self.query_head_dim = query_head_dim
         self.value_head_dim = value_head_dim
@@ -175,22 +178,29 @@ class TTSZipformer(nn.Module):
             time_embed_dim = -1
         self.guidance_scale_embed_dim = guidance_scale_embed_dim
 
-        self.in_proj = nn.Linear(in_dim, encoder_dim)
-        self.out_proj = nn.Linear(encoder_dim, out_dim)
+        self.in_proj = nn.Linear(in_dim, encoder_dim[0])
+        self.out_proj = nn.Linear(encoder_dim[-1], out_dim)
 
         # each one will be Zipformer2Encoder or DownsampledZipformer2Encoder
         encoders = []
+        encoder_proj = []
 
-        num_encoders = len(downsampling_factor)
+        self.num_encoders = num_encoders = len(downsampling_factor)
         for i in range(num_encoders):
+            if i < num_encoders - 1:
+                if encoder_dim[i] != encoder_dim[i + 1]:
+                    encoder_proj.append(nn.Linear(encoder_dim[i], encoder_dim[i + 1]))
+                else:
+                    encoder_proj.append(Identity())
+
             encoder_layer = Zipformer2EncoderLayer(
-                embed_dim=encoder_dim,
+                embed_dim=encoder_dim[i],
                 pos_dim=pos_dim,
                 num_heads=num_heads,
                 query_head_dim=query_head_dim,
                 pos_head_dim=pos_head_dim,
                 value_head_dim=value_head_dim,
-                feedforward_dim=feedforward_dim,
+                feedforward_dim=feedforward_dim[i],
                 use_conv=use_conv,
                 cnn_module_kernel=cnn_module_kernel[i],
                 dropout=dropout,
@@ -201,7 +211,7 @@ class TTSZipformer(nn.Module):
             encoder = Zipformer2Encoder(
                 encoder_layer,
                 num_encoder_layers[i],
-                embed_dim=encoder_dim,
+                embed_dim=encoder_dim[i],
                 time_embed_dim=time_embed_dim,
                 pos_dim=pos_dim,
                 warmup_begin=warmup_batches * (i + 1) / (num_encoders + 1),
@@ -212,13 +222,14 @@ class TTSZipformer(nn.Module):
             if downsampling_factor[i] != 1:
                 encoder = DownsampledZipformer2Encoder(
                     encoder,
-                    dim=encoder_dim,
+                    dim=encoder_dim[i],
                     downsample=downsampling_factor[i],
                 )
 
             encoders.append(encoder)
 
         self.encoders = nn.ModuleList(encoders)
+        self.encoder_proj = nn.ModuleList(encoder_proj)
         if self.use_time_embed:
             self.time_embed = nn.Sequential(
                 nn.Linear(time_embed_dim, time_embed_dim * 2),
@@ -281,6 +292,9 @@ class TTSZipformer(nn.Module):
                 src_key_padding_mask=padding_mask,
                 attn_mask=attn_mask,
             )
+            if i < self.num_encoders - 1:
+                x = self.encoder_proj[i](x)
+
         x = self.out_proj(x)
         x = x.permute(1, 0, 2)
         return x

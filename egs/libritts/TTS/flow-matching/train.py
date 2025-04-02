@@ -97,11 +97,11 @@ def add_model_arguments(parser: argparse.ArgumentParser):
 
     parser.add_argument(
         "--fm-decoder-feedforward-dim",
-        type=int,
-        default=1536,
+        type=str,
+        default="1536,1536,1536,1536,1536",
         help="""
         Feedforward dimension of the zipformer encoder layers per stack: a single
-        int (shared by all stacks). (for flow-matching decoder)
+        int (shared by all stacks) or comma-separated list. (for flow-matching decoder)
         """,
     )
 
@@ -117,11 +117,11 @@ def add_model_arguments(parser: argparse.ArgumentParser):
 
     parser.add_argument(
         "--fm-decoder-dim",
-        type=int,
-        default=512,
+        type=str,
+        default="512,512,512,512,512",
         help="""
         Embedding dimension in encoder stacks: a single int (shared by all stacks).
-        (for flow-matching decoder)
+        or comma-separated list. (for flow-matching decoder)
         """,
     )
 
@@ -145,8 +145,8 @@ def add_model_arguments(parser: argparse.ArgumentParser):
 
     parser.add_argument(
         "--text-encoder-feedforward-dim",
-        type=int,
-        default=512,
+        type=str,
+        default="512",
         help="""
         Feedforward dimension of the zipformer encoder layers, per stack.
         (for text encoder)
@@ -175,8 +175,8 @@ def add_model_arguments(parser: argparse.ArgumentParser):
 
     parser.add_argument(
         "--text-encoder-dim",
-        type=int,
-        default=192,
+        type=str,
+        default="192",
         help="""
         Embedding dimension in encoder stacks: a single int. (for text encoder)
         """,
@@ -880,14 +880,18 @@ def tokenize_text(c: Cut, tokenizer):
 
     # tokenize text in prompt
     if hasattr(c, "prompt"):
-        if hasattr(c.prompt.supervisions[0], "normalized_text"):
-            text = c.prompt.supervisions[0].normalized_text
+        if "custom" not in c.prompt["supervisions"][0]:
+            c.prompt["supervisions"][0]["custom"] = {}
+        if "normalized_text" in c.prompt["supervisions"][0]["custom"]:
+            text = c.prompt["supervisions"][0]["custom"]["normalized_text"]
         else:
-            c.prompt.supervisions[0].normalized_text = c.prompt.supervisions[0].text
-            text = c.prompt.supervisions[0].text
+            c.prompt["supervisions"][0]["custom"]["normalized_text"] = c.prompt[
+                "supervisions"
+            ][0]["text"]
+            text = c.prompt["supervisions"][0]["text"]
         token_ids, tokens = tokenizer.texts_to_token_ids([text], return_tokens=True)
-        c.prompt.supervisions[0].token_ids = token_ids[0]
-        c.prompt.supervisions[0].tokens = tokens[0]
+        c.prompt["supervisions"][0]["custom"]["token_ids"] = token_ids[0]
+        c.prompt["supervisions"][0]["custom"]["tokens"] = tokens[0]
     return c
 
 
@@ -996,7 +1000,7 @@ def run(rank, world_size, args):
     else:
         scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
 
-    scaler = GradScaler(enabled=params.use_fp16, init_scale=1024.0)
+    scaler = GradScaler(enabled=params.use_fp16)
 
     if checkpoints is not None:
         # load state_dict for optimizers

@@ -20,6 +20,7 @@ import argparse
 import logging
 import math
 import os
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -29,7 +30,7 @@ from lhotse.utils import fix_random_seed
 from model import get_distill_model, get_model
 from scipy.io.wavfile import write
 from tokenizer import Tokenizer
-from train import add_model_arguments, get_params
+from train import add_model_arguments, get_params, tokenize_text
 from tts_datamodule import TorchAudioFbank, TorchAudioFbankConfig, TtsDataModule
 from utils import prepare_input, save_plot
 from vocos import Vocos
@@ -629,9 +630,11 @@ def main():
 
     test_cuts = libritts.librispeech_test_clean_prompt_cuts()
 
-    test_dl = libritts.test_prompt_dataloaders(
-        test_cuts, return_audio=params.save_verbose
-    )
+    _tokenize_text = partial(tokenize_text, tokenizer=tokenizer)
+
+    test_cuts = test_cuts.map(_tokenize_text)
+
+    test_dl = libritts.test_dataloaders(test_cuts)
 
     test_sets = ["test"]
     test_dls = [test_dl]
