@@ -1,5 +1,15 @@
 # isort:skip_file
 
+try:
+    import k2
+except Exception as ex:
+    print("k2 is not installed correctly. Some features might not work.")
+    print(
+        "If you encounter errors later, please refer to https://k2-fsa.org/get-started/k2/"
+    )
+
+import sys
+
 from . import checkpoint, decode, dist, env, utils
 
 from .byte_utils import (
@@ -19,15 +29,16 @@ from .checkpoint import (
 
 from .context_graph import ContextGraph, ContextState
 
-from .decode import (
-    get_lattice,
-    nbest_decoding,
-    nbest_oracle,
-    one_best_decoding,
-    rescore_with_attention_decoder,
-    rescore_with_n_best_list,
-    rescore_with_whole_lattice,
-)
+if "k2" in sys.modules:
+    from .decode import (
+        get_lattice,
+        nbest_decoding,
+        nbest_oracle,
+        one_best_decoding,
+        rescore_with_attention_decoder,
+        rescore_with_n_best_list,
+        rescore_with_whole_lattice,
+    )
 
 from .dist import (
     cleanup_dist,
@@ -44,13 +55,8 @@ from .env import (
 from .utils import (
     AttributeDict,
     MetricsTracker,
-    add_eos,
-    add_sos,
-    concat,
     encode_supervisions,
-    get_alignments,
     get_executor,
-    get_texts,
     is_cjk,
     is_jit_tracing,
     is_module_available,
@@ -71,6 +77,16 @@ from .utils import (
     tokenize_by_ja_char,
     write_error_stats,
 )
+
+if "k2" in sys.modules:
+    from .utils import (
+        add_eos,
+        add_sos,
+        concat,
+        get_alignments,
+        get_texts,
+    )
+
 
 from .ngram_lm import NgramLm, NgramLmStateCost
 

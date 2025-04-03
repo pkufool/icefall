@@ -22,8 +22,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
-import k2
-import k2.version
 import lhotse
 import torch
 
@@ -98,12 +96,7 @@ def get_git_branch_name():
 
 def get_env_info() -> Dict[str, Any]:
     """Get the environment information."""
-    return {
-        "k2-version": k2.version.__version__,
-        "k2-build-type": k2.version.__build_type__,
-        "k2-with-cuda": k2.with_cuda,
-        "k2-git-sha1": k2.version.__git_sha1__,
-        "k2-git-date": k2.version.__git_date__,
+    env_dict = {
         "lhotse-version": lhotse.__version__,
         "torch-version": str(torch.__version__),
         "torch-cuda-available": torch.cuda.is_available(),
@@ -113,8 +106,15 @@ def get_env_info() -> Dict[str, Any]:
         "icefall-git-sha1": get_git_sha1(),
         "icefall-git-date": get_git_date(),
         "icefall-path": str(Path(__file__).resolve().parent.parent),
-        "k2-path": str(Path(k2.__file__).resolve()),
         "lhotse-path": str(Path(lhotse.__file__).resolve()),
         "hostname": socket.gethostname(),
         "IP address": socket.gethostbyname(socket.gethostname()),
     }
+    if "k2" in sys.modules:
+        env_dict["k2-path"] = str(Path(k2.__file__).resolve())
+        env_dict["k2-version"] = k2.version.__version__
+        env_dict["k2-build-type"] = k2.version.__build_type__
+        env_dict["k2-with-cuda"] = k2.with_cuda
+        env_dict["k2-git-sha1"] = k2.version.__git_sha1__
+        env_dict["k2-git-date"] = k2.version.__git_date__
+    return env_dict

@@ -15,12 +15,16 @@
 # limitations under the License.
 
 import logging
+import sys
 from typing import Tuple
 
 import torch
 import torch.nn.functional as F
 
-from icefall.utils import add_eos, add_sos, make_pad_mask
+from icefall.utils import make_pad_mask
+
+if "k2" in sys.modules:
+    from icefall.utils import add_eos, add_sos
 
 
 class RnnLmModel(torch.nn.Module):
@@ -171,6 +175,10 @@ class RnnLmModel(torch.nn.Module):
         device = next(self.parameters()).device
         batch_size = len(token_lens)
 
+        if "k2" not in sys.modules:
+            raise ImportError(
+                "k2 is not installed. Please install k2 to use this function."
+            )
         sos_tokens = add_sos(tokens, sos_id)
         tokens_eos = add_eos(tokens, eos_id)
         sos_tokens_row_splits = sos_tokens.shape.row_splits(1)
@@ -272,6 +280,11 @@ class RnnLmModel(torch.nn.Module):
             c = torch.zeros(self.rnn.num_layers, batch_size, self.rnn.hidden_size)
 
         device = next(self.parameters()).device
+
+        if "k2" not in sys.modules:
+            raise ImportError(
+                "k2 is not installed. Please install k2 to use this function."
+            )
 
         sos_tokens = add_sos(tokens, sos_id)
         tokens_eos = add_eos(tokens, eos_id)
