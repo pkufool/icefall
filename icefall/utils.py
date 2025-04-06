@@ -50,7 +50,8 @@ from icefall.checkpoint import average_checkpoints
 from .symbol_table import SymbolTable
 
 if "k2" in sys.modules:
-    from k2_utils import (
+    from .k2_utils import (
+        DecodingResults,
         get_texts,
         get_texts_with_timestamp,
         get_alignments,
@@ -330,20 +331,6 @@ class KeywordResult:
 
     # The triggered phrase
     phrase: str
-
-
-@dataclass
-class DecodingResults:
-    # timestamps[i][k] contains the frame number on which tokens[i][k]
-    # is decoded
-    timestamps: List[List[int]]
-
-    # hyps[i] is the recognition results, i.e., word IDs or token IDs
-    # for the i-th utterance with fast_beam_search_nbest_LG.
-    hyps: Union[List[List[int]], "k2.RaggedTensor"]
-
-    # scores[i][k] contains the log-prob of tokens[i][k]
-    scores: Optional[List[List[float]]] = None
 
 
 def save_alignments(
@@ -1658,7 +1645,7 @@ def parse_timestamp(tokens: List[str], timestamp: List[float]) -> List[float]:
 
 
 def parse_hyp_and_timestamp(
-    res: DecodingResults,
+    res: "DecodingResults",
     subsampling_factor: int,
     frame_shift_ms: float = 10,
     sp: Optional[spm.SentencePieceProcessor] = None,

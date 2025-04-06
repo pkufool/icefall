@@ -18,6 +18,7 @@
 # limitations under the License.
 
 
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import k2
@@ -26,6 +27,20 @@ import torch
 import torch.nn as nn
 
 from .symbol_table import SymbolTable
+
+
+@dataclass
+class DecodingResults:
+    # timestamps[i][k] contains the frame number on which tokens[i][k]
+    # is decoded
+    timestamps: List[List[int]]
+
+    # hyps[i] is the recognition results, i.e., word IDs or token IDs
+    # for the i-th utterance with fast_beam_search_nbest_LG.
+    hyps: Union[List[List[int]], k2.RaggedTensor]
+
+    # scores[i][k] contains the log-prob of tokens[i][k]
+    scores: Optional[List[List[float]]] = None
 
 
 def get_texts(

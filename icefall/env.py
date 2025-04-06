@@ -111,6 +111,9 @@ def get_env_info() -> Dict[str, Any]:
         "IP address": socket.gethostbyname(socket.gethostname()),
     }
     if "k2" in sys.modules:
+        import k2
+        import k2.version
+
         env_dict["k2-path"] = str(Path(k2.__file__).resolve())
         env_dict["k2-version"] = k2.version.__version__
         env_dict["k2-build-type"] = k2.version.__build_type__

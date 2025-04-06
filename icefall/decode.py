@@ -28,7 +28,7 @@ from icefall.lm_wrapper import LmScorer
 from icefall.ngram_lm import NgramLm, NgramLmStateCost
 
 if "k2" in sys.modules:
-    from k2_decode import (
+    from .k2_decode import (
         get_lattice,
         Nbest,
         one_best_decoding,
