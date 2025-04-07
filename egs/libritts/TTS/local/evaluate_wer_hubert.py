@@ -2,8 +2,9 @@
 Calculate WER with Hubert mdoels
 
 # Download Hubert model
-huggingface-cl download facebook/hubert-large-ls960-ft --local-dir model/huggingface/hubert-large-ls960-ft
+huggingface-cli download facebook/hubert-large-ls960-ft --local-dir model/huggingface/hubert-large-ls960-ft
 """
+
 import argparse
 import logging
 import os
@@ -30,13 +31,13 @@ def get_parser():
     parser.add_argument(
         "--model-path",
         type=str,
-        default="model/huggingface/hubert-large-ls960-ft",
+        default="TTS_eval_models/hubert-large-ls960-ft",
         help="path of the huggingface hubert model",
     )
     parser.add_argument(
         "--transcript-path",
         type=str,
-        default="data/transcript/test.tsv",
+        default="data/reference/librispeech-test-clean.tsv",
         help="path of the transcript tsv file",
     )
     parser.add_argument(

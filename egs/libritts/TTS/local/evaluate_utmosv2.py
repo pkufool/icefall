@@ -5,6 +5,7 @@ Calculate UTMOSv2 score with automatic Mean Opinion Score (MOS) prediction syste
 import argparse
 import logging
 import os
+import utmosv2
 
 import numpy as np
 
@@ -20,7 +21,7 @@ def get_parser():
     parser.add_argument(
         "--utmos-model-path",
         type=str,
-        default="/star-home/zhuhan/project/UTMOSv2/",
+        default="TTS_eval_models/utmosv2/fold0_s42_best_model.pth",
         help="path of the UTMOS model",
     )
     return parser
@@ -29,11 +30,8 @@ def get_parser():
 if __name__ == "__main__":
     parser = get_parser()
     args = parser.parse_args()
-    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-    os.environ["UTMOSV2_CHACHE"] = args.utmos_model_path
-    import utmosv2
 
-    model = utmosv2.create_model(pretrained=True)
+    model = utmosv2.create_model(pretrained=True, checkpoint_path=args.utmos_model_path)
     score_dict_list = model.predict(input_dir=args.wav_path)
     score_list = [score_dict["predicted_mos"] for score_dict in score_dict_list]
     logging.info(f"UTMOS score: {np.mean(score_list):.2f}")

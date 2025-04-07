@@ -1,0 +1,10 @@
+huggingface_hub
+tqdm
+torch
+transformers
+soundfile
+librosa
+s3prl
+fairseq
+pytorch_lightning
+modelscope

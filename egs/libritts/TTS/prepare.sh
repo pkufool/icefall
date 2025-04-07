@@ -172,31 +172,6 @@ if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
 fi
 
 if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
-  log "Stage 5: Download pretrained models for evaluation."
-
-  if [ ! -e $dl_dir/test-clean.tar.gz ]; then
-    wget https://huggingface.co/datasets/k2-fsa/LibriSpeech/resolve/main/test-clean.tar.gz -P $dl_dir
-  fi
-  # For China users.
-  if [ ! -e $dl_dir/test-clean.tar.gz ]; then
-    wget https://hf-mirror.com/datasets/k2-fsa/LibriSpeech/resolve/main/test-clean.tar.gz -P $dl_dir
-  fi
-
-  if [ ! -d $dl_dir/LibriSpeech/test-clean ]; then
-    tar -xvf $dl_dir/test-clean.tar.gz -C $dl_dir
-  fi
-
-  mkdir -p $dl_dir/LibriSpeech-PC
-  if [ ! -e $dl_dir/LibriSpeech-PC/test-clean.json ]; then
-    wget https://us.openslr.org/resources/145/manifests.tar.gz -P $dl_dir/LibriSpeech-PC
-    tar -xvf $dl_dir/LibriSpeech-PC/manifests.tar.gz -C $dl_dir/LibriSpeech-PC
-  fi
-
-  python local/compute_fbank.py --dataset librispeech --subset test-clean
-  python local/prepare_prompts_librispeech_test_clean.py
-fi
-
-if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
   log "Stage 5: Compute Spectrogram for LibriTTS (for VITS system)"
   mkdir -p data/spectrogram
   if [ ! -e data/spectrogram/.libritts.done ]; then

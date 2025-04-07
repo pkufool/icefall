@@ -2,7 +2,7 @@
 Calculate Frechet Speech Distance betweeen two speech directories.
 
 # Download wav2vec 2.0 model
-huggingface-cl download facebook/wav2vec2-base --local-dir model/huggingface/wav2vec2_base
+huggingface-cli download facebook/wav2vec2-base --local-dir model/huggingface/wav2vec2_base
 
 """
 import argparse
@@ -33,7 +33,7 @@ def get_parser():
     parser.add_argument(
         "--model-path",
         type=str,
-        default="model/huggingface/wav2vec2_base",
+        default="TTS_eval_models/wav2vec2_base",
         help="path of the wav2vec 2.0 model directory",
     )
     parser.add_argument(
@@ -54,7 +54,7 @@ def get_parser():
 class FrechetSpeechDistance:
     def __init__(
         self,
-        model_path="model/huggingface/wav2vec2_base",
+        model_path="TTS_eval_models/wav2vec2_base",
         pca_dim=128,
         speech_load_worker=8,
     ):
@@ -92,6 +92,16 @@ class FrechetSpeechDistance:
 
         embd_lst = []
         for fname in tqdm(os.listdir(dir)):
+            if os.path.splitext(fname)[-1] not in [
+                ".wav",
+                ".flac",
+                ".mp3",
+                ".ogg",
+                ".m4a",
+                ".opus",
+            ]:
+                logging.warning(f"skipping {fname}")
+                continue
             speech = _load_speech_task(os.path.join(dir, fname), self.sample_rate)
             input_features = self.feature_extractor(
                 speech, sampling_rate=self.sample_rate, return_tensors="pt"

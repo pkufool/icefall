@@ -32,13 +32,13 @@ def get_parser():
     parser.add_argument(
         "--utmos-model-path",
         type=str,
-        default="model/huggingface/utmos/utmos.pt",
+        default="TTS_eval_models/utmos/utmos.pt",
         help="path of the UTMOS model",
     )
     parser.add_argument(
         "--ssl-model-path",
         type=str,
-        default="model/huggingface/utmos/wav2vec_small.pt",
+        default="TTS_eval_models/utmos/wav2vec_small.pt",
         help="path of the wav2vec SSL model",
     )
     return parser
@@ -100,6 +100,16 @@ class UTMOSScore:
 
         score_lst = []
         for fname in tqdm(os.listdir(dir)):
+            if os.path.splitext(fname)[-1] not in [
+                ".wav",
+                ".flac",
+                ".mp3",
+                ".ogg",
+                ".m4a",
+                ".opus",
+            ]:
+                logging.warning(f"skipping {fname}")
+                continue
             speech = _load_speech_task(os.path.join(dir, fname), self.sample_rate)
             speech = speech.to(self.device)
             with torch.no_grad():

@@ -30,13 +30,13 @@ def get_parser():
     parser.add_argument(
         "--sv-model-path",
         type=str,
-        default="model/UniSpeech/wavlm_large_finetune.pth",
+        default="TTS_eval_models/UniSpeech/wavlm_large_finetune.pth",
         help="path of the wavlm-based ECAPA-TDNN model",
     )
     parser.add_argument(
         "--ssl-model-path",
         type=str,
-        default="model/s3prl/wavlm_large.pt",
+        default="TTS_eval_models/s3prl/wavlm_large.pt",
         help="path of the wavlm SSL model",
     )
     return parser
@@ -45,8 +45,8 @@ def get_parser():
 class SpeakerSimilarity:
     def __init__(
         self,
-        sv_model_path="model/UniSpeech/wavlm_large_finetune.pth",
-        ssl_model_path="model/s3prl/wavlm_large.pt",
+        sv_model_path="TTS_eval_models/UniSpeech/wavlm_large_finetune.pth",
+        ssl_model_path="TTS_eval_models/s3prl/wavlm_large.pt",
     ):
         """
         Initialize
@@ -91,6 +91,16 @@ class SpeakerSimilarity:
 
         embd_lst = []
         for fname in tqdm(os.listdir(dir)):
+            if os.path.splitext(fname)[-1] not in [
+                ".wav",
+                ".flac",
+                ".mp3",
+                ".ogg",
+                ".m4a",
+                ".opus",
+            ]:
+                logging.warning(f"skipping {fname}")
+                continue
             speech = _load_speech_task(os.path.join(dir, fname), self.sample_rate)
             speech = speech.to(self.device)
             with torch.no_grad():
