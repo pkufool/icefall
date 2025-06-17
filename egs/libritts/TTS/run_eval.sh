@@ -9,6 +9,12 @@ generated_wav_path="flow-matching/exp/generated_wavs"
 . shared/parse_options.sh || exit 1
 
 
+log() {
+  # This function is from espnet
+  local fname=${BASH_SOURCE[1]##*/}
+  echo -e "$(date '+%Y-%m-%d %H:%M:%S') (${fname}:${BASH_LINENO[0]}:${FUNCNAME[1]}) $*"
+}
+
 if [ $stage -le -2 ] && [ $stop_stage -ge -2 ]; then
   log "Stage -2: Install dependencies and download models"
 
@@ -65,5 +71,5 @@ if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
   log "Stage 5: Evaluate the model with WER."
 
   python local/evaluate_wer_hubert.py --wav-path $generated_wav_path \
-    --decode-path $generated_wav_path/decode \ 
+    --decode-path $generated_wav_path/decode 
 fi

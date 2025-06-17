@@ -1,5 +1,6 @@
 # Copyright      2023-2024  Xiaomi Corp.        (authors: Zengwei Yao
-#                                                         Han Zhu)
+#                                                         Han Zhu
+#                                                         Wei Kang)
 #
 # See ../../LICENSE for clarification regarding multiple authors
 #

@@ -41,7 +41,7 @@ def get_parser():
         help="path of the transcript tsv file",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=64, help="decoding batch size"
+        "--batch-size", type=int, default=20, help="decoding batch size"
     )
     parser.add_argument(
         "--device", type=str, default="cuda:0", help="decoding device, cuda:0 or cpu"
