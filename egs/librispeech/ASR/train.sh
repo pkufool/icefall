@@ -28,7 +28,7 @@ if [ $stage -le 100 ] && [ $stop_stage -ge 100 ]; then
       --max-copies 2 \
       --start-epoch 1 \
       --use-fp16 1 \
-      --batches-per-epoch 9000 \
+      --batches-per-epoch 10000 \
       --train-manifests data/fbank/wenetspeech_cuts_L_fixed_1w.jsonl.gz \
                         data/fbank/gigaspeech_cuts_XL.jsonl.gz \
       --valid-manifests data/fbank/wenetspeech_cuts_DEV.jsonl.gz \
@@ -41,7 +41,7 @@ if [ $stage -le 100 ] && [ $stop_stage -ge 100 ]; then
       --ctc-loss-scale 0.2 \
       --base-lr 0.023 \
       --num-workers 4 \
-      --max-duration 1000
+      --max-duration 900
 fi
 
 
