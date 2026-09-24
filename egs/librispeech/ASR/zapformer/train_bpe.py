@@ -380,6 +380,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="If True, use attention-decoder head.",
     )
 
+    parser.add_argument(
+        "--context-size",
+        type=int,
+        default=2,
+        help="The context size in the decoder. 1 means bigram; 2 means tri-gram",
+    )
+
 
 def load_manifest_lazy(manifest_path: str) -> CutSet:
     """Load a manifest lazily from a path."""
@@ -540,13 +547,6 @@ def get_parser():
         default=600,
         help="Reference batch duration for purposes of adjusting batch counts for setting various "
         "schedules inside the model",
-    )
-
-    parser.add_argument(
-        "--context-size",
-        type=int,
-        default=2,
-        help="The context size in the decoder. 1 means bigram; 2 means tri-gram",
     )
 
     parser.add_argument(

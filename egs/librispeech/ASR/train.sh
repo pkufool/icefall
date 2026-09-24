@@ -44,76 +44,41 @@ if [ $stage -le 100 ] && [ $stop_stage -ge 100 ]; then
       --max-duration 900
 fi
 
-
-if [ $stage -le 102 ] && [ $stop_stage -ge 102 ]; then
-    (
+# base-dim-64 CTC greedy search decoding
+if [ $stage -le 200 ] && [ $stop_stage -ge 200 ]; then
     export CUDA_VISIBLE_DEVICES="4"
-    for avg in 2; do
-      python zapformer/decode_wds_simple.py \
-        --epoch 18 \
-        --avg $avg \
-        --test-sets reference,data/tars/reference.lst \
-                  kespeech,data/tars/kespeech_test.lst \
-                  evaluation,data/tars/evaluation.lst \
-        --exp-dir exp/zapformer/base-dim-64 \
-        --bpe-model data/zh-10103.vocab \
-        --use-ctc 1 \
-        --use-transducer 1 \
-        --base-dim 64 \
-        --max-duration 400 \
-        --decoding-method rnnt-greedy-search
-    done
-    ) &
 
-    (
+    python zapformer/decode_bpe.py \
+      --epoch 15 \
+      --avg 2 \
+      --use-averaged-model true \
+      --exp-dir exp/zapformer/base-dim-64 \
+      --bpe-model zh-en-8776 \
+      --decoding-method ctc-greedy-search \
+      --base-dim 64 \
+      --max-duration 300 \
+      --num-workers 2 \
+      --test-manifest gigaspeech_TEST,data/fbank/gigaspeech_cuts_TEST.jsonl.gz \
+      --test-manifest wenetspeech_TEST_NET,data/fbank/wenetspeech_cuts_TEST_NET.jsonl.gz \
+      --test-manifest wenetspeech_TEST_MEETING,data/fbank/wenetspeech_cuts_TEST_MEETING.jsonl.gz
+fi
+
+# base-dim-64 RNNT greedy search decoding
+if [ $stage -le 201 ] && [ $stop_stage -ge 201 ]; then
     export CUDA_VISIBLE_DEVICES="5"
-    for avg in 2; do
-      python zapformer/decode_wds_simple.py \
-        --epoch 18 \
-        --avg $avg \
-        --test-sets reference,data/tars/reference.lst \
-                  kespeech,data/tars/kespeech_test.lst \
-                  evaluation,data/tars/evaluation.lst \
-        --exp-dir exp/zapformer/base-dim-64 \
-        --bpe-model data/zh-10103.vocab \
-        --use-ctc 1 \
-        --use-transducer 1 \
-        --base-dim 64 \
-        --max-duration 400 \
-        --decoding-method ctc-greedy-search
-    done
-    ) &
-    wait
+
+    python zapformer/decode_bpe.py \
+      --epoch 15 \
+      --avg 2 \
+      --use-averaged-model true \
+      --exp-dir exp/zapformer/base-dim-64 \
+      --bpe-model zh-en-8776 \
+      --decoding-method rnnt-greedy-search \
+      --base-dim 64 \
+      --max-duration 300 \
+      --num-workers 2 \
+      --test-manifest gigaspeech_TEST,data/fbank/gigaspeech_cuts_TEST.jsonl.gz \
+      --test-manifest wenetspeech_TEST_NET,data/fbank/wenetspeech_cuts_TEST_NET.jsonl.gz \
+      --test-manifest wenetspeech_TEST_MEETING,data/fbank/wenetspeech_cuts_TEST_MEETING.jsonl.gz
 fi
 
-if [ $stage -le 106 ] && [ $stop_stage -ge 106 ]; then
-    for item in 0,0.02,0.3 0,0.03,0.3 1,0.01,0.2 1,0.01,0.4 2,0.01,0.25 2,0.01,0.35 3,0.01,0.3 3,0.015,0.3; do
-      (
-        export CUDA_VISIBLE_DEVICES=$(echo $item | cut -d, -f1)
-        lm_scale=$(echo $item | cut -d, -f3)
-        ngram_scale=$(echo $item | cut -d, -f2)
-        python zapformer/decode.py \
-          --epoch 15 \
-          --avg 2 \
-          --test-sets reference,data/tars/reference.lst \
-                      kespeech,data/tars/kespeech_test.lst \
-          --exp-dir exp/zapformer/base-dim-64 \
-          --bpe-model data/zh-10103.vocab \
-          --use-ctc 1 \
-          --use-transducer 1 \
-          --base-dim 64 \
-          --use-shallow-fusion 1 \
-          --lm-vocab-size 10103 \
-          --backoff-id 10103 \
-          --lm-epoch 99 \
-          --lm-avg 2 \
-          --lm-exp-dir /star-ssd/kangwei/worktree/zapformer_3346/egs/librispeech/ASR/data/ngram/exp-lr5e-4-dtiny \
-          --lm-scale $lm_scale \
-          --ngram-lm-scale $ngram_scale \
-          --lang-dir /star-ssd/kangwei/worktree/zapformer_3346/egs/librispeech/ASR/data/ngram \
-          --max-duration 400 \
-          --decoding-method modified_beam_search_LODR
-      ) &
-    done
-    wait
-fi

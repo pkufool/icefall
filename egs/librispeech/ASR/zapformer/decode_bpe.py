@@ -27,10 +27,10 @@ from icefall.utils import (
     str2bool,
     write_error_stats,
 )
+from lhotse.cut import CutSet
 from ssentencepiece import Ssentencepiece
-from tqdm import tqdm
-from train import add_model_arguments, get_model, get_params
-from atdataset import ATDataloader, Fbank
+from train_bpe import add_model_arguments, get_model, get_params
+from asr_datamodule import AsrDataModule
 
 from icefall.checkpoint import (
     average_checkpoints,
@@ -135,15 +135,6 @@ def get_parser() -> argparse.ArgumentParser:
         help="Maximum symbols per frame for rnnt greedy search",
     )
     parser.add_argument(
-        "--max-duration",
-        type=float,
-        default=600.0,
-        help="Maximum duration (s) for each cut",
-    )
-    parser.add_argument(
-        "--test-xiaoai", type=str2bool, default=False, help="Use XiaoAI test set list"
-    )
-    parser.add_argument(
         "--search-avg",
         type=str2bool,
         default=True,
@@ -151,9 +142,14 @@ def get_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--test-sets",
-        nargs="*",
-        help="A list of test sets, e.g., dev,data/tars/librispeech_dev.lst",
+        "--test-manifest",
+        type=str,
+        action="append",
+        default=[],
+        help="Test manifest in the format 'test_name,manifest_path'. "
+        "Can be specified multiple times for multiple test sets. "
+        "Example: --test-manifest test-clean,data/fbank/librispeech_cuts_test-clean.jsonl.gz "
+        "--test-manifest test-other,data/fbank/librispeech_cuts_test-other.jsonl.gz",
     )
     add_model_arguments(parser)
     return parser
@@ -256,11 +252,11 @@ def decode_batch_rnnt(
     batch: dict,
 ) -> Dict[str, List[List[str]]]:
     device = next(model.parameters()).device
-    features = batch["feature"]
+    features = batch["inputs"]
     # at entry, features is (N, T, C)
     assert features.ndim == 3
     features = features.to(device)
-    feature_lens = batch["feature_lens"].to(device)
+    feature_lens = batch["supervisions"]["num_frames"].to(device)
 
     if params.causal:
         pad_len = 30
@@ -296,11 +292,11 @@ def decode_batch_ctc(
     batch: dict,
 ) -> Dict[str, List[List[str]]]:
     device = params.device
-    features = batch["feature"]
+    features = batch["inputs"]
     # at entry, features is (N, T, C)
     assert features.ndim == 3
     features = features.to(device)
-    feature_lens = batch["feature_lens"].to(device)
+    feature_lens = batch["supervisions"]["num_frames"].to(device)
 
     if params.causal:
         pad_len = 30
@@ -348,10 +344,12 @@ def decode_dataset(
     results = defaultdict(list)
     log_interval = 20
 
-    for batch_idx, batch in enumerate(tqdm(dl, total=len(dl))):
-        texts = batch["text"]
-        cut_ids = batch["ids"]
-        if not cut_ids:
+    for batch_idx, batch in enumerate(dl):
+        texts = batch["supervisions"]["text"]
+        cuts = batch["supervisions"].get("cut", None)
+        if cuts is not None:
+            cut_ids = [c.id for c in cuts]
+        else:
             cut_ids = list(range(len(texts)))
 
         hyps_dict = decode_fn(params=params, model=model, sp=sp, batch=batch)
@@ -424,15 +422,21 @@ def save_wer_results(
     logging.info(summary)
 
 
-def filter_func(sample):
-    if sample["audio"].size(1) < 16000 * 0.2:
-        return False
-    return True
+def load_manifest_lazy(manifest_path: str) -> CutSet:
+    """Load a manifest lazily from a path."""
+    manifest_path = Path(manifest_path)
+    if manifest_path.suffix == ".gz":
+        return CutSet.from_jsonl_lazy(manifest_path)
+    elif manifest_path.suffix in (".json", ".yaml"):
+        return CutSet.from_file(manifest_path)
+    else:
+        return CutSet.from_jsonl_lazy(manifest_path)
 
 
 @torch.no_grad()
 def main():
     parser = get_parser()
+    AsrDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
 
@@ -486,38 +490,15 @@ def main():
     model.to(device)
     model.eval()
 
-    feature_extractor = Fbank(
-        sample_rate=params.sample_rate, n_mels=params.feature_dim
-    )
+    # Parse --test-manifest arguments: each is "test_name,manifest_path"
+    test_sets = dict()
+    for item in args.test_manifest:
+        key, path = item.split(",", 1)
+        test_sets[key] = path
 
-    if params.test_sets is not None and len(params.test_sets) > 0:
-        test_sets = dict()
-        for item in params.test_sets:
-            key, path = item.split(",")
-            test_sets[key] = path
-    elif params.test_xiaoai:
-        test_sets = {
-            "xiaoai_test": "data/tars/xiaoai_cellphone_llm_0906.lst",
-        }
-    else:
-        if params.search_avg:
-            test_sets = {
-                "aishell_test": "data/tars/aishell_test.lst",
-                "test_other": "data/tars/librispeech_test-other.lst",
-            }
-        else:
-            test_sets = {
-                "aishell_test": "data/tars/aishell_test.lst",
-                "aishell2_test": "data/tars/aishell2_test.lst",
-                "TEST_NET": "data/tars/wenetspeech_test_net.lst",
-                "TEST_MEETING": "data/tars/wenetspeech_test_meeting.lst",
-                "test_clean": "data/tars/librispeech_test-clean.lst",
-                "test_other": "data/tars/librispeech_test-other.lst",
-                "gigaspeech_TEST": "data/tars/gigaspeech_TEST.lst",
-                "cv22_en_test": "data/tars/cv22-en_test.lst",
-                "cv22_zh_CN_test": "data/tars/cv22-zh-CN_test.lst",
-                "kespeech": "data/tars/kespeech_test.lst",
-            }
+    if not test_sets:
+        logging.warning("No test manifests specified via --test-manifest. Nothing to decode.")
+        return
 
     decode_fn = (
         decode_batch_ctc
@@ -525,16 +506,21 @@ def main():
         else decode_batch_rnnt
     )
 
-    for test_set, manifest in test_sets.items():
-        test_dl = ATDataloader(
-            datasets=manifest,
-            max_duration=params.max_duration,
-            feature_extractor=feature_extractor,
-            sample_rate=params.sample_rate,
-            is_test=True,
-            num_workers=0,
-            filter_func=filter_func,
-        )
+    asr_datamodule = AsrDataModule(args)
+
+    def remove_short_utt(c):
+        T = ((c.num_frames - 7) // 2 + 1) // 2
+        if T <= 0:
+            logging.warning(
+                f"Exclude cut with ID {c.id} from decoding, num_frames : {c.num_frames}."
+            )
+        return T > 0
+
+    for test_set_name, manifest_path in test_sets.items():
+        logging.info(f"Decoding test set: {test_set_name} from {manifest_path}")
+        cuts = load_manifest_lazy(manifest_path)
+        cuts = cuts.filter(remove_short_utt)
+        test_dl = asr_datamodule.test_dataloaders(cuts)
 
         results_dict = decode_dataset(
             dl=test_dl,
@@ -545,10 +531,10 @@ def main():
         )
 
         save_asr_output(
-            params=params, test_set_name=test_set, results_dict=results_dict
+            params=params, test_set_name=test_set_name, results_dict=results_dict
         )
         save_wer_results(
-            params=params, test_set_name=test_set, results_dict=results_dict
+            params=params, test_set_name=test_set_name, results_dict=results_dict
         )
 
     logging.info("Done!")
